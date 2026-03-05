@@ -1,0 +1,60 @@
+# =============================================================================
+# Docker Build Context Exclusions
+# =============================================================================
+
+# Dependencies (reinstalled in Docker)
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+.next/
+out/
+build/
+dist/
+
+# Environment files (secrets — passed at runtime)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Version control
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Documentation (not needed in image)
+docs/
+*.md
+!README.md
+
+# Test artifacts
+coverage/
+.nyc_output/
+__tests__/
+**/*.test.ts
+**/*.spec.ts
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Docker files (prevent recursive context)
+Dockerfile
+Dockerfile.worker
+docker-compose.yml
+docker-compose.override.yml
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Supabase local
+supabase/.temp/
+
+# Gemini / AI
+.gemini/

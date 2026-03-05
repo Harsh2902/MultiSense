@@ -1,0 +1,50 @@
+# =============================================================================
+# Docker Compose — Local Development Stack
+# =============================================================================
+# Usage: docker compose up
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Web Server (Next.js)
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
+        - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+        - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Background Worker (Queue Processor)
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - WORKER_POLL_BASE_MS=2000
+      - WORKER_POLL_MAX_MS=30000
+      - WORKER_BATCH_SIZE=5
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy

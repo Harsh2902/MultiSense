@@ -1,0 +1,56 @@
+# =============================================================================
+# Worker Dockerfile — Background Queue Processor
+# =============================================================================
+# Build: docker build -f Dockerfile.worker -t slp-worker .
+# Run:   docker run --env-file .env slp-worker
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Install dependencies
+# ---------------------------------------------------------------------------
+FROM node:20-alpine AS deps
+
+WORKDIR /app
+
+RUN apk add --no-cache libc6-compat
+
+COPY package.json package-lock.json* ./
+
+# Install all dependencies (worker needs runtime deps)
+RUN npm ci --omit=dev
+
+# Also install tsx for running TypeScript directly
+RUN npm install -g tsx
+
+# ---------------------------------------------------------------------------
+# Stage 2: Prepare source
+# ---------------------------------------------------------------------------
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+# Create non-root user
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 worker
+
+# Install tsx globally
+RUN npm install -g tsx
+
+# Copy production dependencies
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy source files needed by worker
+COPY package.json ./
+COPY tsconfig.json ./
+COPY src/ ./src/
+
+# Switch to non-root user
+USER worker
+
+# No EXPOSE needed — worker has no HTTP server
+# No HEALTHCHECK — worker uses heartbeat logging instead
+
+# Start the worker
+CMD ["tsx", "src/worker.ts"]
