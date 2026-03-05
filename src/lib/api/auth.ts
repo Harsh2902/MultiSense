@@ -3,6 +3,7 @@
 // =============================================================================
 
 import { NextResponse } from 'next/server';
+import { cookies } from 'next/headers';
 import { createClient } from '@/lib/supabase/server';
 import type { User } from '@supabase/supabase-js';
 import type { ApiError } from '@/types/chat';
@@ -24,26 +25,16 @@ export type AuthResult =
 /**
  * Require authentication for an API route
  * Returns user and supabase client if authenticated, error response otherwise
- * 
- * @returns AuthResult with user and client or error response
- * 
- * @example
- * ```ts
- * export async function POST(request: Request) {
- *   const auth = await requireAuth();
- *   if (!auth.success) return auth.error;
- *   
- *   const { user, supabase } = auth;
- *   // ... use authenticated user
- * }
- * ```
  */
 export async function requireAuth(): Promise<AuthResult> {
     try {
         const supabase = await createClient();
         const { data: { user }, error } = await supabase.auth.getUser();
 
-        if (error) {
+        const cookieStore = await cookies();
+        const isDemoSession = cookieStore.get('demo_session')?.value === 'true';
+
+        if (error && !isDemoSession) {
             console.error('[Auth] Error getting user:', error.message);
             return {
                 success: false,
@@ -58,7 +49,7 @@ export async function requireAuth(): Promise<AuthResult> {
             };
         }
 
-        if (!user) {
+        if (!user && !isDemoSession) {
             return {
                 success: false,
                 error: NextResponse.json<ApiError>(
@@ -68,7 +59,17 @@ export async function requireAuth(): Promise<AuthResult> {
             };
         }
 
-        return { success: true, user, supabase };
+        // Return a mock user for demo sessions if no real user exists
+        const activeUser: User = user || {
+            id: 'guest-user-000000000000',
+            app_metadata: {},
+            user_metadata: { full_name: 'Guest User' },
+            aud: 'authenticated',
+            created_at: new Date().toISOString(),
+            email: 'guest@demo.local',
+        } as unknown as User;
+
+        return { success: true, user: activeUser, supabase };
     } catch (err) {
         console.error('[Auth] Unexpected error:', err);
         return {
