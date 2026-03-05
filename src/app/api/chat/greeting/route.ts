@@ -16,9 +16,9 @@ export async function POST(request: NextRequest): Promise<Response> {
 
     // 3. Parallelize Checks (Rate Limit & Token Estimate)
     const checksPromise = Promise.all([
-        checkRateLimit(auth.user.id, 'chat'),
-        debitTokenBudget(auth.supabase, {
-            userId: auth.user.id,
+        checkRateLimit(auth.userId, 'chat'),
+        debitTokenBudget({
+            userId: auth.userId,
             feature: 'chat',
             provider: 'google',
             inputTokens: 50,

@@ -1,4 +1,5 @@
 
+import { ClerkProvider } from '@clerk/nextjs';
 import Providers from './providers';
 import { RootErrorBoundary } from '@/features/shared/components/ErrorBoundary';
 import './globals.css';
@@ -14,14 +15,16 @@ export default function RootLayout({
     children: React.ReactNode;
 }) {
     return (
-        <html lang="en">
-            <body suppressHydrationWarning>
-                <Providers>
-                    <RootErrorBoundary>
-                        {children}
-                    </RootErrorBoundary>
-                </Providers>
-            </body>
-        </html>
+        <ClerkProvider>
+            <html lang="en">
+                <body suppressHydrationWarning>
+                    <Providers>
+                        <RootErrorBoundary>
+                            {children}
+                        </RootErrorBoundary>
+                    </Providers>
+                </body>
+            </html>
+        </ClerkProvider>
     );
 }

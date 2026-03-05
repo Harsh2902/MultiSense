@@ -1,13 +1,15 @@
 // =============================================================================
-// Summary Service - Generate and manage summaries via RAG
+// Summary Service - Generate and manage summaries via RAG (Prisma)
 // =============================================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 import type {
     SummaryRow,
     SummaryType,
     GeneratedSummary,
     SummaryResponse,
+    SummaryStatus
 } from '@/types/study';
 import {
     STUDY_CONFIG,
@@ -27,15 +29,13 @@ import { StudyToolError } from '@/services/quiz.service';
 // =============================================================================
 
 export class SummaryService {
-    private supabase: SupabaseClient;
     private userId: string;
     private ragService: RagService;
     private llm: LLMProvider;
 
-    constructor(supabase: SupabaseClient, userId: string) {
-        this.supabase = supabase;
+    constructor(userId: string) {
         this.userId = userId;
-        this.ragService = new RagService(supabase, userId);
+        this.ragService = new RagService(userId);
         this.llm = createLLMProvider();
     }
 
@@ -74,23 +74,22 @@ export class SummaryService {
         }
 
         // 5. Create summary record (status: generating)
-        const { data: summary, error: createError } = await this.supabase
-            .from('summaries')
-            .insert({
-                user_id: this.userId,
-                conversation_id: conversationId,
-                summary_type: summaryType,
-                title: this.getSummaryTitle(summaryType, topic),
-                status: 'generating',
-                version: nextVersion,
-                metadata: { topic, summaryType, contextTokens: context.tokenCount },
-            })
-            .select()
-            .single();
-
-        if (createError || !summary) {
+        let summary;
+        try {
+            summary = await prisma.summary.create({
+                data: {
+                    user_id: this.userId,
+                    conversation_id: conversationId,
+                    summary_type: summaryType,
+                    title: this.getSummaryTitle(summaryType, topic),
+                    status: 'generating',
+                    version: nextVersion,
+                    metadata: { topic, summaryType, contextTokens: context.tokenCount } as Prisma.JsonObject,
+                }
+            });
+        } catch (createError: any) {
             // Check for unique constraint violation (concurrent generation)
-            if (createError?.code === '23505') {
+            if (createError?.code === 'P2002') {
                 throw new StudyToolError(
                     'A summary of this type is already being generated',
                     'CONCURRENT_GENERATION'
@@ -115,13 +114,15 @@ export class SummaryService {
             }
 
             // 7b. Atomic budget enforcement
-            const debit = await debitTokenBudget(this.supabase, {
+            // Note: debitTokenBudget internally should use Prisma now
+            const debit = await debitTokenBudget({
                 userId: this.userId,
                 feature: 'summary',
                 provider: 'groq',
                 inputTokens: promptTokens,
                 outputTokens: STUDY_CONFIG.SUMMARY_MAX_TOKENS,
             });
+
             if (!debit.allowed) {
                 await this.markSummaryFailed(summary.id);
                 throw new BudgetExceededError(debit);
@@ -155,25 +156,17 @@ export class SummaryService {
             const wordCount = generated.content.trim().split(/\s+/).length;
 
             // 10. Update summary with content
-            const { data: updated, error: updateError } = await this.supabase
-                .from('summaries')
-                .update({
+            const updated = await prisma.summary.update({
+                where: { id: summary.id },
+                data: {
                     title: generated.title || summary.title,
                     content: generated.content,
                     status: 'ready',
                     word_count: wordCount,
-                    updated_at: new Date().toISOString(),
-                })
-                .eq('id', summary.id)
-                .select()
-                .single();
+                }
+            });
 
-            if (updateError || !updated) {
-                await this.markSummaryFailed(summary.id);
-                throw new StudyToolError('Failed to store summary', 'STORE_FAILED');
-            }
-
-            return { summary: updated };
+            return { summary: { ...updated, summary_type: updated.summary_type as SummaryType, status: updated.status as SummaryStatus, created_at: updated.created_at.toISOString(), updated_at: updated.updated_at.toISOString() } as unknown as SummaryRow };
         } catch (error) {
             if (error instanceof StudyToolError) throw error;
             await this.markSummaryFailed(summary.id);
@@ -189,21 +182,18 @@ export class SummaryService {
         conversationId: string,
         summaryType?: SummaryType
     ): Promise<SummaryResponse[]> {
-        let query = this.supabase
-            .from('summaries')
-            .select('*')
-            .eq('user_id', this.userId)
-            .eq('conversation_id', conversationId)
-            .eq('status', 'ready')
-            .order('created_at', { ascending: false });
 
-        if (summaryType) {
-            query = query.eq('summary_type', summaryType);
-        }
+        const summaries = await prisma.summary.findMany({
+            where: {
+                user_id: this.userId,
+                conversation_id: conversationId,
+                status: 'ready',
+                ...(summaryType ? { summary_type: summaryType } : {})
+            },
+            orderBy: { created_at: 'desc' }
+        });
 
-        const { data: summaries } = await query;
-
-        return (summaries || []).map((s: SummaryRow) => ({ summary: s }));
+        return summaries.map((s) => ({ summary: { ...s, summary_type: s.summary_type as SummaryType, status: s.status as SummaryStatus, created_at: s.created_at.toISOString(), updated_at: s.updated_at.toISOString() } as unknown as SummaryRow }));
     }
 
     // ===========================================================================
@@ -211,14 +201,17 @@ export class SummaryService {
     // ===========================================================================
 
     private async checkRateLimit(): Promise<void> {
-        const oneHourAgo = new Date(Date.now() - 3600_000).toISOString();
-        const { count } = await this.supabase
-            .from('summaries')
-            .select('*', { count: 'exact', head: true })
-            .eq('user_id', this.userId)
-            .gte('created_at', oneHourAgo);
+        const oneHourAgo = new Date(Date.now() - 3600_000);
+        const count = await prisma.summary.count({
+            where: {
+                user_id: this.userId,
+                created_at: {
+                    gte: oneHourAgo
+                }
+            }
+        });
 
-        if ((count ?? 0) >= STUDY_CONFIG.GENERATION_RATE_LIMIT_PER_HOUR) {
+        if (count >= STUDY_CONFIG.GENERATION_RATE_LIMIT_PER_HOUR) {
             throw new StudyToolError(
                 'Rate limit exceeded. Please wait before generating more summaries.',
                 'RATE_LIMITED'
@@ -234,23 +227,24 @@ export class SummaryService {
         conversationId: string,
         summaryType: SummaryType
     ): Promise<number> {
-        const { data } = await this.supabase
-            .from('summaries')
-            .select('version')
-            .eq('user_id', this.userId)
-            .eq('conversation_id', conversationId)
-            .eq('summary_type', summaryType)
-            .order('version', { ascending: false })
-            .limit(1);
+        const data = await prisma.summary.findFirst({
+            where: {
+                user_id: this.userId,
+                conversation_id: conversationId,
+                summary_type: summaryType
+            },
+            select: { version: true },
+            orderBy: { version: 'desc' },
+        });
 
-        return (data?.[0]?.version ?? 0) + 1;
+        return (data?.version ?? 0) + 1;
     }
 
     private async markSummaryFailed(summaryId: string): Promise<void> {
-        await this.supabase
-            .from('summaries')
-            .update({ status: 'failed', updated_at: new Date().toISOString() })
-            .eq('id', summaryId);
+        await prisma.summary.update({
+            where: { id: summaryId },
+            data: { status: 'failed' }
+        });
     }
 
     private getSummaryTitle(type: SummaryType, topic?: string): string {

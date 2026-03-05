@@ -10,8 +10,10 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "@clerk/nextjs": "^7.0.1",
     "@distube/ytdl-core": "^4.16.12",
     "@google/generative-ai": "^0.24.1",
+    "@prisma/client": "^6.19.2",
     "@radix-ui/react-alert-dialog": "^1.1.15",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-dropdown-menu": "^2.1.16",
@@ -58,6 +60,7 @@
     "eslint": "^9.17.0",
     "eslint-config-next": "^16.1.6",
     "postcss": "^8.4.38",
+    "prisma": "^6.19.2",
     "tailwindcss": "^3.4.17",
     "tailwindcss-animate": "^1.0.7",
     "tsconfig-paths": "^4.2.0",

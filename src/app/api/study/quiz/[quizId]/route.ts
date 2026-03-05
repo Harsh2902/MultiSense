@@ -23,7 +23,7 @@ export const GET = withApiHandler(async (
 ): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     // Resolve params (Next.js 15)
     // context?.params might be a Promise or object depending on version/mocking
@@ -43,7 +43,7 @@ export const GET = withApiHandler(async (
         throw new ValidationError('Invalid quiz ID');
     }
 
-    const quizService = new QuizService(auth.supabase, auth.user.id);
+    const quizService = new QuizService(auth.userId);
     const result = await quizService.getQuiz(quizId);
 
     return NextResponse.json<QuizResponse>(result);

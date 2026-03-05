@@ -1,7 +1,6 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { RagPipeline } from '@/lib/rag/pipeline';
-import { createClient } from '@/lib/supabase/server';
 
 export const dynamic = 'force-dynamic';
 
@@ -13,16 +12,14 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: 'documentId is required' }, { status: 400 });
         }
 
-        const supabase = await createClient();
+        const { prisma } = await import('@/lib/prisma');
 
         // Fetch document metadata to ensure it exists and we have access
-        const { data: doc, error } = await supabase
-            .from('documents')
-            .select('*')
-            .eq('id', documentId)
-            .single();
+        const doc = await prisma.learningSource.findUnique({
+            where: { id: documentId }
+        });
 
-        if (error || !doc) {
+        if (!doc) {
             return NextResponse.json({ error: 'Document not found' }, { status: 404 });
         }
 
@@ -31,18 +28,20 @@ export async function POST(req: NextRequest) {
         // For local/VPS, it's fine. Ideally use a queue.
         const pipeline = new RagPipeline();
 
+        const meta = doc.metadata as Record<string, any> || {};
+
         // Run in background (fire and forget) if possible, or await if short.
         // For debugging/MVP, let's await to see errors.
         await pipeline.processDocument({
             id: doc.id,
             userId: doc.user_id,
             title: doc.title,
-            originalFilename: doc.original_filename,
-            filePath: doc.file_path,
-            fileType: doc.file_type,
-            mimeType: doc.mime_type,
-            metadata: doc.metadata,
-            status: doc.status,
+            originalFilename: typeof meta.original_filename === 'string' ? meta.original_filename : doc.title,
+            filePath: typeof meta.file_path === 'string' ? meta.file_path : '',
+            fileType: (typeof meta.file_type === 'string' ? meta.file_type : 'text') as any,
+            mimeType: typeof meta.mime_type === 'string' ? meta.mime_type : '',
+            metadata: meta,
+            status: doc.status as any,
         });
 
         return NextResponse.json({ success: true, message: 'Processing started/completed' });

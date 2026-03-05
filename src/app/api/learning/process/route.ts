@@ -14,19 +14,18 @@ import { setRequestUserId } from '@/lib/request-context';
 export const POST = withApiHandler(async (_request: NextRequest): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
-    console.log(`[API] Triggering processing for user ${auth.user.id}`);
+    console.log(`[API] Triggering processing for user ${auth.userId}`);
     try {
         const fs = await import('fs');
         const path = await import('path');
         const logFile = path.join(process.cwd(), 'youtube-debug.log');
-        fs.appendFileSync(logFile, `[API] ${new Date().toISOString()}: Triggering processPendingSources for ${auth.user.id}\n`);
+        fs.appendFileSync(logFile, `[API] ${new Date().toISOString()}: Triggering processPendingSources for ${auth.userId}\n`);
     } catch { }
 
     const results = await processPendingSources(
-        auth.supabase,
-        auth.user.id,
+        auth.userId,
         { batchSize: 3 }
     );
 

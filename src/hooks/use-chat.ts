@@ -5,7 +5,6 @@
 'use client';
 
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { getClient } from '@/lib/supabase/client';
 import type {
     ConversationRow,
     ConversationWithPreview,
@@ -504,53 +503,18 @@ export function useChatStream() {
 }
 
 // =============================================================================
-// useRealtimeMessages - Supabase realtime subscription
+// useRealtimeMessages - Placeholder (Supabase Realtime removed)
 // =============================================================================
 
 /**
- * Hook for subscribing to real-time message updates
- * Useful for multi-tab sync
+ * Placeholder hook — Supabase Realtime was removed during migration to Neon/Prisma.
+ * Real-time sync can be re-added later using WebSockets or polling.
  */
 export function useRealtimeMessages(
-    conversationId: string | null,
-    onNewMessage: (message: MessageRow) => void,
-    onMessageUpdate?: (message: MessageRow) => void
+    _conversationId: string | null,
+    _onNewMessage: (message: MessageRow) => void,
+    _onMessageUpdate?: (message: MessageRow) => void
 ) {
-    useEffect(() => {
-        if (!conversationId) return;
-
-        const supabase = getClient();
-
-        const channel = supabase
-            .channel(`messages:${conversationId}`)
-            .on(
-                'postgres_changes',
-                {
-                    event: 'INSERT',
-                    schema: 'public',
-                    table: 'messages',
-                    filter: `conversation_id=eq.${conversationId}`,
-                },
-                (payload) => {
-                    onNewMessage(payload.new as MessageRow);
-                }
-            )
-            .on(
-                'postgres_changes',
-                {
-                    event: 'UPDATE',
-                    schema: 'public',
-                    table: 'messages',
-                    filter: `conversation_id=eq.${conversationId}`,
-                },
-                (payload) => {
-                    onMessageUpdate?.(payload.new as MessageRow);
-                }
-            )
-            .subscribe();
-
-        return () => {
-            supabase.removeChannel(channel);
-        };
-    }, [conversationId, onNewMessage, onMessageUpdate]);
+    // No-op: realtime not available with Prisma/Neon
 }
+

@@ -1,17 +1,16 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { OllamaEmbedder } from '@/lib/rag/embeddings/ollama';
-import { SupabaseVectorStore } from '@/lib/rag/vector-store/supabase';
+import { PrismaVectorStore } from '@/lib/rag/vector-store/prisma';
 import { QwenLLM } from '@/lib/rag/llm/qwen';
-import { createClient } from '@/lib/supabase/server';
+import { auth } from '@clerk/nextjs/server';
 
 export async function POST(req: NextRequest) {
     try {
         const { message, history } = await req.json();
-        const supabase = await createClient();
-        const { data: { user } } = await supabase.auth.getUser();
+        const { userId } = await auth();
 
-        if (!user) {
+        if (!userId) {
             return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
         }
 
@@ -20,9 +19,9 @@ export async function POST(req: NextRequest) {
         const queryEmbedding = await embedder.embed(message);
 
         // 2. Retrieve Context
-        const store = new SupabaseVectorStore();
+        const store = new PrismaVectorStore();
         // Limit to top 5 chunks
-        const results = await store.similaritySearch(queryEmbedding, 5, user.id);
+        const results = await store.similaritySearch(queryEmbedding, 5, userId);
 
         if (results.length === 0) {
             return NextResponse.json({

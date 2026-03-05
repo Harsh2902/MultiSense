@@ -2,19 +2,19 @@
 import { RagDocument, LoaderInterface, DocumentChunk } from './types';
 import { ChunkingStrategy } from './processing/chunking';
 import { OllamaEmbedder } from './embeddings/ollama';
-import { SupabaseVectorStore } from './vector-store/supabase';
+import { PrismaVectorStore } from './vector-store/prisma';
 import { PDFLoader } from './ingestion/pdf-loader';
 import { TextLoader } from './ingestion/text-loader';
 
 export class RagPipeline {
     private chunker: ChunkingStrategy;
     private embedder: OllamaEmbedder;
-    private store: SupabaseVectorStore;
+    private store: PrismaVectorStore;
 
     constructor() {
         this.chunker = new ChunkingStrategy();
         this.embedder = new OllamaEmbedder();
-        this.store = new SupabaseVectorStore();
+        this.store = new PrismaVectorStore();
     }
 
     async processDocument(doc: RagDocument): Promise<void> {

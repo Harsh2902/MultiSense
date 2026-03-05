@@ -9,13 +9,11 @@
 //   npx tsx src/worker.ts
 //
 // Environment:
-//   Requires SUPABASE_SERVICE_ROLE_KEY, NEXT_PUBLIC_SUPABASE_URL, etc.
+//   Requires DATABASE_URL, etc.
 //   See .env.example for the full list.
 //
 // =============================================================================
 
-import { createClient } from '@supabase/supabase-js';
-import type { Database } from '@/types/database';
 import { processPendingSources } from '@/lib/queue/processor';
 import { validateAllEnvVars } from '@/config/env';
 import { installShutdownHandlers, isShutdown } from '@/lib/shutdown';
@@ -31,29 +29,6 @@ const POLL_MAX_MS = parseInt(process.env.WORKER_POLL_MAX_MS || '30000', 10);
 const BATCH_SIZE = parseInt(process.env.WORKER_BATCH_SIZE || '5', 10);
 const HEARTBEAT_INTERVAL_MS = 60_000; // Log heartbeat every 60s
 const WORKER_ID = `worker-${process.pid}-${Date.now().toString(36)}`;
-
-// =============================================================================
-// Supabase Client (Service Role — bypasses RLS)
-// =============================================================================
-
-function createServiceClient() {
-    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-    if (!url || !key) {
-        throw new Error(
-            'Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. ' +
-            'The worker requires these environment variables.'
-        );
-    }
-
-    return createClient<Database>(url, key, {
-        auth: {
-            autoRefreshToken: false,
-            persistSession: false,
-        },
-    });
-}
 
 // =============================================================================
 // Poll Loop with Exponential Backoff
@@ -72,7 +47,6 @@ async function runWorker(): Promise<void> {
     // Install shutdown handlers
     installShutdownHandlers();
 
-    const supabase = createServiceClient();
     let currentInterval = POLL_BASE_MS;
     let totalProcessed = 0;
     let totalFailed = 0;
@@ -88,7 +62,7 @@ async function runWorker(): Promise<void> {
     // Main loop
     while (!isShutdown()) {
         try {
-            const results = await processPendingSources(supabase, undefined, {
+            const results = await processPendingSources(undefined, {
                 batchSize: BATCH_SIZE,
             });
 

@@ -20,7 +20,7 @@ import type { CreateConversationResponse, PaginatedResponse, ConversationWithPre
 export const GET = withApiHandler(async (request: NextRequest): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const searchParams = request.nextUrl.searchParams;
     const queryResult = listConversationsQuerySchema.safeParse({
@@ -33,7 +33,7 @@ export const GET = withApiHandler(async (request: NextRequest): Promise<NextResp
         throw new ValidationError('Validation failed', queryResult.error.flatten());
     }
 
-    const chatService = new ChatService(auth.supabase, auth.user.id);
+    const chatService = new ChatService(auth.userId);
     const result = await chatService.listConversations(queryResult.data);
 
     return NextResponse.json<PaginatedResponse<ConversationWithPreview>>(result);
@@ -49,9 +49,9 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
 
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
-    const rateLimitError = await checkRateLimit(auth.user.id, 'chat');
+    const rateLimitError = await checkRateLimit(auth.userId, 'chat');
     if (rateLimitError) return rateLimitError;
 
     let body: unknown;
@@ -66,7 +66,7 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
         throw new ValidationError('Validation failed', validationResult.error.flatten());
     }
 
-    const chatService = new ChatService(auth.supabase, auth.user.id);
+    const chatService = new ChatService(auth.userId);
     const conversation = await chatService.createConversation(validationResult.data);
 
     return NextResponse.json<CreateConversationResponse>(

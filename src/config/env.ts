@@ -39,22 +39,30 @@ function getOptionalEnv(key: string, defaultValue: string): string {
 }
 
 // =============================================================================
-// Supabase Configuration
+// Authentication Configuration (Clerk)
 // =============================================================================
 
-export const supabaseConfig = {
-    /** Supabase project URL */
-    url: getRequiredEnv('NEXT_PUBLIC_SUPABASE_URL'),
+export const clerkConfig = {
+    /** Clerk publishable key */
+    publishableKey: getOptionalEnv('NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY', ''),
 
-    /** Supabase anonymous key (safe for client-side) */
-    anonKey: getRequiredEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY'),
-
-    /** Supabase service role key (server-side only, bypasses RLS) */
-    get serviceRoleKey(): string {
+    /** Clerk secret key (server-side only) */
+    get secretKey(): string {
         if (typeof window !== 'undefined') {
-            throw new Error('Service role key must not be accessed on client-side');
+            throw new Error('Clerk secret key must not be accessed on client-side');
         }
-        return getRequiredEnv('SUPABASE_SERVICE_ROLE_KEY');
+        return getOptionalEnv('CLERK_SECRET_KEY', '');
+    },
+} as const;
+
+// =============================================================================
+// Database Configuration (Neon + Prisma)
+// =============================================================================
+
+export const databaseConfig = {
+    /** Database URL for Prisma */
+    get url(): string {
+        return getRequiredEnv('DATABASE_URL');
     },
 } as const;
 
@@ -162,10 +170,7 @@ interface EnvValidationResult {
  */
 export function validateAllEnvVars(): EnvValidationResult {
     const required = [
-        'NEXT_PUBLIC_SUPABASE_URL',
-        'NEXT_PUBLIC_SUPABASE_ANON_KEY',
-        'SUPABASE_SERVICE_ROLE_KEY',
-        'GROQ_API_KEY',
+        'DATABASE_URL',
     ];
 
     const optional = [

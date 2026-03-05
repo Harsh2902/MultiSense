@@ -8,6 +8,7 @@ import { SummaryService } from '@/services/summary.service';
 import type { SummaryResponse, SummaryType } from '@/types/study';
 import { ValidationError, NotFoundError } from '@/lib/errors';
 import { setRequestUserId } from '@/lib/request-context';
+import { prisma } from '@/lib/prisma';
 
 // =============================================================================
 // GET /api/study/summary/[conversationId]
@@ -19,7 +20,7 @@ export const GET = withApiHandler(async (
 ): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const conversationId = context?.params?.conversationId;
     if (!conversationId || !/^[0-9a-f-]{36}$/i.test(conversationId)) {
@@ -27,14 +28,12 @@ export const GET = withApiHandler(async (
     }
 
     // Verify conversation ownership
-    const { data: conv, error: convError } = await auth.supabase
-        .from('conversations')
-        .select('id')
-        .eq('id', conversationId)
-        .eq('user_id', auth.user.id)
-        .single();
+    const conv = await prisma.conversation.findUnique({
+        where: { id: conversationId },
+        select: { user_id: true }
+    });
 
-    if (convError || !conv) {
+    if (!conv || conv.user_id !== auth.userId) {
         throw new NotFoundError('Conversation', conversationId);
     }
 
@@ -44,7 +43,7 @@ export const GET = withApiHandler(async (
     const validTypes: SummaryType[] = ['bullet', 'paragraph', 'exam'];
     const summaryType = typeParam && validTypes.includes(typeParam) ? typeParam : undefined;
 
-    const summaryService = new SummaryService(auth.supabase, auth.user.id);
+    const summaryService = new SummaryService(auth.userId);
     const results = await summaryService.getSummary(conversationId, summaryType);
 
     return NextResponse.json<SummaryResponse[]>(results);

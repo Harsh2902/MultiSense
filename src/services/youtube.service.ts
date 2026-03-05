@@ -1,8 +1,9 @@
 // =============================================================================
-// YouTube Service - Orchestrates YouTube video processing
+// YouTube Service - Orchestrates YouTube video processing (Prisma)
 // =============================================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 import type {
     YouTubeVideoMetadata,
     YouTubeProcessingConfig,
@@ -28,16 +29,13 @@ import { chunkText } from '@/lib/files/chunker';
 // =============================================================================
 
 export class YouTubeService {
-    private supabase: SupabaseClient;
     private userId: string;
     private config: YouTubeProcessingConfig;
 
     constructor(
-        supabase: SupabaseClient,
         userId: string,
         config: Partial<YouTubeProcessingConfig> = {}
     ) {
-        this.supabase = supabase;
         this.userId = userId;
         this.config = { ...DEFAULT_YOUTUBE_CONFIG, ...config };
     }
@@ -141,7 +139,9 @@ export class YouTubeService {
         }
 
         const source = claimed;
-        const videoId = source.metadata?.videoId as string;
+        const videoId = typeof source.metadata === 'object' && source.metadata
+            ? (source.metadata as any).videoId as string
+            : undefined;
 
         // Debug Log
         const log = (msg: string) => {
@@ -241,7 +241,7 @@ export class YouTubeService {
             // 7b. Generate embeddings (CRITICAL for RAG)
             log(`Importing EmbeddingService...`);
             const { EmbeddingService } = await import('@/lib/embeddings/service');
-            const embeddingService = new EmbeddingService(this.supabase);
+            const embeddingService = new EmbeddingService(); // Removed supabase dependency!
 
             log(`Starting embedding generation...`);
             await embeddingService.embedSourceChunks(sourceId);
@@ -276,16 +276,15 @@ export class YouTubeService {
         conversationId: string,
         videoId: string
     ): Promise<LearningSource | null> {
-        const { data } = await this.supabase
-            .from('learning_sources')
-            .select('*')
-            .eq('user_id', this.userId)
-            .eq('conversation_id', conversationId)
-            .eq('source_url', `https://www.youtube.com/watch?v=${videoId}`)
-            .limit(1)
-            .single();
+        const data = await prisma.learningSource.findFirst({
+            where: {
+                user_id: this.userId,
+                conversation_id: conversationId,
+                source_url: `https://www.youtube.com/watch?v=${videoId}`
+            }
+        });
 
-        return data;
+        return data ? { ...data, created_at: data.created_at.toISOString(), updated_at: data.updated_at.toISOString() } as unknown as LearningSource : null;
     }
 
     private async createSource(
@@ -294,9 +293,8 @@ export class YouTubeService {
         metadata: YouTubeVideoMetadata,
         canonicalUrl: string
     ): Promise<LearningSource> {
-        const { data, error } = await this.supabase
-            .from('learning_sources')
-            .insert({
+        const data = await prisma.learningSource.create({
+            data: {
                 user_id: this.userId,
                 conversation_id: conversationId,
                 source_type: 'youtube',
@@ -304,46 +302,57 @@ export class YouTubeService {
                 title: metadata.title,
                 original_filename: metadata.title,
                 file_type: 'txt', // Use 'txt' as we extract transcript, 'video' is restricted by DB constraint
-                status: 'pending' as ProcessingStatus,
+                status: 'pending',
                 metadata: {
                     videoId,
                     title: metadata.title,
                     channel: metadata.channel,
                     thumbnailUrl: metadata.thumbnailUrl,
                     durationSeconds: metadata.durationSeconds,
-                },
-            })
-            .select()
-            .single();
+                } as Prisma.JsonObject,
+            }
+        });
 
-        if (error) throw error;
-        return data;
+        return { ...data, created_at: data.created_at.toISOString(), updated_at: data.updated_at.toISOString() } as unknown as LearningSource;
     }
 
     private async claimProcessing(sourceId: string): Promise<LearningSource | null> {
-        const { data, error } = await this.supabase
-            .from('learning_sources')
-            .update({
-                status: 'processing' as ProcessingStatus,
-                updated_at: new Date().toISOString(),
-            })
-            .eq('id', sourceId)
-            .eq('user_id', this.userId)
-            .in('status', ['pending', 'processing'])
-            .select()
-            .single();
+        try {
+            const data = await prisma.learningSource.update({
+                where: {
+                    id: sourceId,
+                    user_id: this.userId,
+                    status: { in: ['pending', 'processing'] }
+                },
+                data: {
+                    status: 'processing'
+                }
+            });
 
-        if (error || !data) return null;
-        return data;
+            return { ...data, created_at: data.created_at.toISOString(), updated_at: data.updated_at.toISOString() } as unknown as LearningSource;
+        } catch (error) {
+            // Usually triggered if the source doesn't exist or is not pending/processing
+            return null;
+        }
     }
 
     private async updateSourceMetadata(
         sourceId: string,
         updates: Record<string, unknown>
     ): Promise<void> {
-        await this.supabase.rpc('update_source_metadata', {
-            p_source_id: sourceId,
-            p_updates: updates,
+        const current = await prisma.learningSource.findUnique({
+            where: { id: sourceId },
+            select: { metadata: true }
+        });
+
+        await prisma.learningSource.update({
+            where: { id: sourceId },
+            data: {
+                metadata: {
+                    ...((current?.metadata as Record<string, unknown>) ?? {}),
+                    ...updates
+                } as Prisma.JsonObject
+            }
         });
     }
 
@@ -351,49 +360,58 @@ export class YouTubeService {
         sourceId: string,
         chunks: Array<{ content: string; index: number; tokenCount: number }>
     ): Promise<Array<{ id: string }>> {
-        const { data, error } = await this.supabase
-            .from('source_chunks')
-            .insert(
-                chunks.map((chunk) => ({
-                    source_id: sourceId,
-                    content: chunk.content,
-                    chunk_index: chunk.index,
-                    token_count: chunk.tokenCount,
-                    metadata: {},
-                }))
-            )
-            .select('id');
+        const rows = chunks.map((chunk) => ({
+            source_id: sourceId,
+            content: chunk.content,
+            chunk_index: chunk.index,
+            token_count: chunk.tokenCount,
+            metadata: {},
+        }));
 
-        if (error) throw error;
-        return data || [];
+        await prisma.sourceChunk.createMany({
+            data: rows
+        });
+
+        // We need to return chunks with IDs. Since Prisma createMany doesn't return IDs natively for postgres, 
+        // we fetch them immediately after (ordered by chunk_index).
+        const inserted = await prisma.sourceChunk.findMany({
+            where: { source_id: sourceId },
+            orderBy: { chunk_index: 'asc' },
+            select: { id: true }
+        });
+
+        return inserted;
     }
 
     private async markCompleted(
         sourceId: string,
         stats: Record<string, unknown>
     ): Promise<void> {
-        await this.supabase
-            .from('learning_sources')
-            .update({
-                status: 'completed' as ProcessingStatus,
-                updated_at: new Date().toISOString(),
-                metadata: this.supabase.rpc('jsonb_merge', {
-                    target: 'metadata',
-                    patch: { processingStats: stats },
-                }),
-            })
-            .eq('id', sourceId);
+        const current = await prisma.learningSource.findUnique({
+            where: { id: sourceId },
+            select: { metadata: true }
+        });
+
+        await prisma.learningSource.update({
+            where: { id: sourceId },
+            data: {
+                status: 'completed',
+                metadata: {
+                    ...((current?.metadata as Record<string, unknown>) ?? {}),
+                    processingStats: stats
+                } as Prisma.JsonObject
+            }
+        });
     }
 
     private async markFailed(sourceId: string, error: string): Promise<void> {
-        await this.supabase
-            .from('learning_sources')
-            .update({
-                status: 'failed' as ProcessingStatus,
-                updated_at: new Date().toISOString(),
-                error_message: error,
-            })
-            .eq('id', sourceId);
+        await prisma.learningSource.update({
+            where: { id: sourceId },
+            data: {
+                status: 'failed',
+                error_message: error
+            }
+        });
     }
 }
 

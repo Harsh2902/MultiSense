@@ -29,7 +29,7 @@ export async function GET(
 ): Promise<NextResponse> {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const params = await context.params;
     const paramsResult = getSourceParamsSchema.safeParse(params);
@@ -37,10 +37,10 @@ export async function GET(
         throw new ValidationError('Invalid source ID');
     }
 
-    const learningService = new LearningService(auth.supabase, auth.user.id);
+    const learningService = new LearningService(auth.userId);
     const source = await learningService.getSource(paramsResult.data.sourceId);
 
-    if (!source || source.user_id !== auth.user.id) {
+    if (!source || source.user_id !== auth.userId) {
         throw new NotFoundError('Source', paramsResult.data.sourceId);
     }
 
@@ -70,7 +70,7 @@ export async function DELETE(
 
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const params = await context.params;
     const paramsResult = getSourceParamsSchema.safeParse(params);
@@ -78,10 +78,10 @@ export async function DELETE(
         throw new ValidationError('Invalid source ID');
     }
 
-    const learningService = new LearningService(auth.supabase, auth.user.id);
+    const learningService = new LearningService(auth.userId);
     const source = await learningService.getSource(paramsResult.data.sourceId);
 
-    if (!source || source.user_id !== auth.user.id) {
+    if (!source || source.user_id !== auth.userId) {
         throw new NotFoundError('Source', paramsResult.data.sourceId);
     }
 
@@ -107,7 +107,7 @@ export async function POST(
 
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const params = await context.params;
     const paramsResult = getSourceParamsSchema.safeParse(params);
@@ -115,10 +115,10 @@ export async function POST(
         throw new ValidationError('Invalid source ID');
     }
 
-    const learningService = new LearningService(auth.supabase, auth.user.id);
+    const learningService = new LearningService(auth.userId);
     const source = await learningService.getSource(paramsResult.data.sourceId);
 
-    if (!source || source.user_id !== auth.user.id) {
+    if (!source || source.user_id !== auth.userId) {
         throw new NotFoundError('Source', paramsResult.data.sourceId);
     }
 
@@ -136,7 +136,7 @@ export async function POST(
     // Re-queue for processing
     await getProcessingQueue().add(
         source.id,
-        auth.user.id,
+        auth.userId,
         source.conversation_id
     );
 

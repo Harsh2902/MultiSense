@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Plus, MessageSquare, BookOpen, GraduationCap, Settings, LogOut, PanelLeftClose, PanelLeftOpen, Trash2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { createClient } from '@/lib/supabase/client';
+import { useUser, useClerk } from '@clerk/nextjs';
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -36,23 +36,13 @@ export function Sidebar() {
     const [isCollapsed, setIsCollapsed] = useState(false);
     const [isGuest, setIsGuest] = useState(false);
     const [isChecked, setIsChecked] = useState(false);
-    const [userName, setUserName] = useState('');
-    const [userEmail, setUserEmail] = useState('');
+
+    const { user, isLoaded } = useUser();
+    const { signOut } = useClerk();
 
     useEffect(() => {
         setIsGuest(document.cookie.includes('demo_session=true'));
         setIsChecked(true);
-
-        // Fetch user details
-        const fetchUser = async () => {
-            const supabase = createClient();
-            const { data: { user } } = await supabase.auth.getUser();
-            if (user) {
-                setUserName(user.user_metadata?.full_name || '');
-                setUserEmail(user.email || '');
-            }
-        };
-        fetchUser();
     }, []);
 
     const { mutate: deleteConversationMutation } = useDeleteConversation();
@@ -213,16 +203,16 @@ export function Sidebar() {
                                 isCollapsed && "justify-center px-0"
                             )}
                         >
-                            <div className="h-8 w-8 rounded bg-green-600 flex items-center justify-center text-white font-bold">
-                                {isGuest ? 'G' : 'S'}
+                            <div className="h-8 w-8 rounded bg-green-600 flex items-center justify-center text-white font-bold overflow-hidden">
+                                {isGuest ? 'G' : (user?.imageUrl ? <img src={user.imageUrl} alt="Avatar" className="h-full w-full object-cover" /> : 'S')}
                             </div>
                             {!isCollapsed && (
                                 <div className="flex flex-col items-start overflow-hidden">
                                     <span className="text-sm font-medium text-zinc-100 truncate w-full">
-                                        {isGuest ? 'Guest User' : (userName || 'Student')}
+                                        {isGuest ? 'Guest User' : (user?.fullName || 'Student')}
                                     </span>
                                     <span className="text-xs text-zinc-500 truncate w-full">
-                                        {isGuest ? 'Demo Mode' : (userEmail || 'View Profile')}
+                                        {isGuest ? 'Demo Mode' : (user?.primaryEmailAddress?.emailAddress || 'View Profile')}
                                     </span>
                                 </div>
                             )}
@@ -247,12 +237,12 @@ export function Sidebar() {
                         <DropdownMenuItem
                             className="focus:bg-zinc-800 text-red-400 focus:text-red-400 cursor-pointer"
                             onClick={async () => {
-                                // Clear Supabase session
-                                const supabase = createClient();
-                                await supabase.auth.signOut();
-
                                 // Clear demo cookie
                                 document.cookie = 'demo_session=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+
+                                if (!isGuest) {
+                                    await signOut();
+                                }
 
                                 // Redirect
                                 router.push('/login');

@@ -1,12 +1,12 @@
 // =============================================================================
-// Embedding Service - Batch embedding with retry logic
+// Embedding Service - Batch embedding with retry logic (Prisma)
 // =============================================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 import type { EmbeddingProvider, EmbeddingResult } from '@/types/rag';
 import { RAG_CONFIG } from '@/types/rag';
 import { createEmbeddingProvider } from './provider';
-import { EMBEDDING_MODELS } from '@/config/models';
 
 // =============================================================================
 // Service Class
@@ -16,11 +16,9 @@ import { EMBEDDING_MODELS } from '@/config/models';
  * Service for generating and storing embeddings
  */
 export class EmbeddingService {
-    private supabase: SupabaseClient;
     private provider: EmbeddingProvider;
 
-    constructor(supabase: SupabaseClient, provider?: EmbeddingProvider) {
-        this.supabase = supabase;
+    constructor(provider?: EmbeddingProvider) {
         this.provider = provider || createEmbeddingProvider();
     }
 
@@ -34,15 +32,11 @@ export class EmbeddingService {
      */
     async embedSourceChunks(sourceId: string): Promise<EmbeddingResult> {
         // 1. Get all chunks for this source
-        const { data: chunks, error: fetchError } = await this.supabase
-            .from('source_chunks')
-            .select('id, content')
-            .eq('source_id', sourceId)
-            .order('chunk_index', { ascending: true });
-
-        if (fetchError) {
-            throw new Error(`Failed to fetch chunks: ${fetchError.message}`);
-        }
+        const chunks = await prisma.sourceChunk.findMany({
+            where: { source_id: sourceId },
+            select: { id: true, content: true },
+            orderBy: { chunk_index: 'asc' }
+        });
 
         if (!chunks || chunks.length === 0) {
             return { success: [], failed: [], count: 0 };
@@ -115,41 +109,38 @@ export class EmbeddingService {
 
     /**
      * Store multiple embeddings
+     * Uses Prisma raw SQL for vector operations
      */
     private async storeEmbeddings(
         chunks: Array<{ id: string }>,
         embeddings: number[][]
     ): Promise<void> {
-        const rows = chunks.map((chunk, i) => ({
-            chunk_id: chunk.id,
-            embedding: embeddings[i],
-            model: EMBEDDING_MODELS.openai.default,
-        }));
+        // Perform multiple raw updates sequentially or within a transaction
+        // as standard Prisma functions don't support pgvector inserting
 
-        const { error } = await this.supabase
-            .from('embeddings')
-            .upsert(rows, { onConflict: 'chunk_id' });
-
-        if (error) {
-            throw new Error(`Failed to store embeddings: ${error.message}`);
-        }
+        await prisma.$transaction(
+            chunks.map((chunk, i) => {
+                const vectorString = `[${(embeddings[i] || []).join(',')}]`;
+                return prisma.$executeRawUnsafe(
+                    `UPDATE "source_chunks" SET embedding = $1::vector WHERE id = $2`,
+                    vectorString,
+                    chunk.id
+                );
+            })
+        );
     }
 
     /**
      * Store single embedding
+     * Uses Prisma raw SQL for vector operations
      */
     private async storeEmbedding(chunkId: string, embedding: number[]): Promise<void> {
-        const { error } = await this.supabase
-            .from('embeddings')
-            .upsert({
-                chunk_id: chunkId,
-                embedding,
-                model: EMBEDDING_MODELS.openai.default,
-            }, { onConflict: 'chunk_id' });
-
-        if (error) {
-            throw new Error(`Failed to store embedding: ${error.message}`);
-        }
+        const vectorString = `[${embedding.join(',')}]`;
+        await prisma.$executeRawUnsafe(
+            `UPDATE "source_chunks" SET embedding = $1::vector WHERE id = $2`,
+            vectorString,
+            chunkId
+        );
     }
 
     // ===========================================================================
@@ -208,9 +199,3 @@ export class EmbeddingService {
         return result;
     }
 }
-
-// =============================================================================
-// Export
-// =============================================================================
-
-// EmbeddingService is exported via class declaration

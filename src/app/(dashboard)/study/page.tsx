@@ -9,7 +9,6 @@ import { Input } from '@/components/ui/input';
 import { useRouter } from 'next/navigation';
 import { useConversations } from '@/features/chat/hooks/useConversations'; // Use feature hook
 import { submitYouTube } from '@/features/learning/api';
-import { createClient } from '@/lib/supabase/client';
 
 export default function StudyPage() {
     const [isYoutubeOpen, setIsYoutubeOpen] = useState(false);
@@ -47,13 +46,15 @@ export default function StudyPage() {
             const { triggerProcessing } = await import('@/features/learning/api');
             await triggerProcessing(source.id);
 
-            // 4. Add an initial message to the conversation
-            const supabase = createClient();
-            await supabase.from('messages').insert({
-                conversation_id: conversation.id,
-                role: 'assistant',
-                content: `I've started processing your video! 🎬\n\nIt helps if you can tell me what you'd like to focus on, or I can give you a summary once it's ready.`,
-            } as any);
+            // 4. Add an initial message to the conversation via API
+            await fetch('/api/chat/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    conversation_id: conversation.id,
+                    content: `I've started processing a YouTube video! Please give me a summary once it's ready.`,
+                }),
+            });
 
             // 5. Auto-request summary
             await fetch('/api/chat/send', {

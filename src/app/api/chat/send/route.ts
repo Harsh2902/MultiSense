@@ -71,7 +71,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     if (!auth.success) return auth.error;
 
     // 3. Rate limit check
-    const rateLimitError = await checkRateLimit(auth.user.id, 'chat');
+    const rateLimitError = await checkRateLimit(auth.userId, 'chat');
     if (rateLimitError) return rateLimitError;
 
     // 4. Parse and validate body
@@ -100,7 +100,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     const { conversation_id, content } = validationResult.data;
 
     // 5. Verify conversation exists AND belongs to user (explicit ownership check)
-    const chatService = new ChatService(auth.supabase, auth.user.id);
+    const chatService = new ChatService(auth.userId);
     const conversation = await chatService.getConversation(conversation_id);
 
     if (!conversation) {
@@ -111,8 +111,8 @@ export async function POST(request: NextRequest): Promise<Response> {
     }
 
     // EXPLICIT OWNERSHIP CHECK (defense-in-depth, RLS is primary)
-    if (conversation.user_id !== auth.user.id) {
-        console.warn(`[Security] User ${auth.user.id} attempted to access conversation ${conversation_id} owned by ${conversation.user_id}`);
+    if (conversation.user_id !== auth.userId) {
+        console.warn(`[Security] User ${auth.userId} attempted to access conversation ${conversation_id} owned by ${conversation.user_id}`);
         return NextResponse.json<ApiError>(
             { error: 'Conversation not found', code: 'NOT_FOUND' },
             { status: 404 }
@@ -156,7 +156,7 @@ export async function POST(request: NextRequest): Promise<Response> {
                 } catch { }
 
                 const { RagService } = await import('@/services/rag.service');
-                const ragService = new RagService(auth.supabase, auth.user.id);
+                const ragService = new RagService(auth.userId);
 
                 // Retrieve relevant chunks for the user's query
                 const ragContext = await ragService.retrieveContext(
@@ -203,8 +203,8 @@ export async function POST(request: NextRequest): Promise<Response> {
         const contextWindow = buildContextWindow(history, systemPrompt);
 
         // 9b. Token budget enforcement (atomic debit)
-        const debit = await debitTokenBudget(auth.supabase, {
-            userId: auth.user.id,
+        const debit = await debitTokenBudget({
+            userId: auth.userId,
             feature: 'chat',
             provider: 'google', // Updated to google
             inputTokens: contextWindow.total_tokens,

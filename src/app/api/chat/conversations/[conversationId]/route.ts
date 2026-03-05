@@ -29,12 +29,9 @@ export async function GET(
     request: NextRequest,
     context: RouteContext
 ): Promise<NextResponse> {
-    // Note: This route uses Promise params pattern (Next.js 15) so it
-    // cannot use withApiHandler directly. We keep it as-is with manual error handling
-    // but use the error system internally.
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const params = await context.params;
     const paramsResult = getConversationParamsSchema.safeParse(params);
@@ -42,7 +39,7 @@ export async function GET(
         throw new ValidationError('Invalid conversation ID', paramsResult.error.flatten());
     }
 
-    const chatService = new ChatService(auth.supabase, auth.user.id);
+    const chatService = new ChatService(auth.userId);
     const conversation = await chatService.getConversation(paramsResult.data.conversationId);
 
     if (!conversation) {
@@ -65,7 +62,7 @@ export async function PATCH(
 
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const params = await context.params;
     const paramsResult = getConversationParamsSchema.safeParse(params);
@@ -85,7 +82,7 @@ export async function PATCH(
         throw new ValidationError('Validation failed', validationResult.error.flatten());
     }
 
-    const chatService = new ChatService(auth.supabase, auth.user.id);
+    const chatService = new ChatService(auth.userId);
     const existing = await chatService.getConversation(paramsResult.data.conversationId);
     if (!existing) {
         throw new NotFoundError('Conversation', paramsResult.data.conversationId);
@@ -115,7 +112,7 @@ export async function DELETE(
 
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const params = await context.params;
     const paramsResult = getConversationParamsSchema.safeParse(params);
@@ -123,31 +120,25 @@ export async function DELETE(
         throw new ValidationError('Invalid conversation ID');
     }
 
-    const chatService = new ChatService(auth.supabase, auth.user.id);
+    const chatService = new ChatService(auth.userId);
     const existing = await chatService.getConversation(paramsResult.data.conversationId);
     if (!existing) {
         throw new NotFoundError('Conversation', paramsResult.data.conversationId);
     }
 
-    // Dynamic import to avoid circular dependencies if any, though explicit here is fine
     const { LearningService } = await import('@/services/learning.service');
-    const learningService = new LearningService(auth.supabase, auth.user.id);
+    const learningService = new LearningService(auth.userId);
 
-    // 1. Fetch all learning sources for this conversation
     const sources = await learningService.listSources(paramsResult.data.conversationId);
 
-    // 2. Delete each source (this handles storage cleanup)
-    // We use Promise.all to do it in parallel, but handle errors gracefully
-    await Promise.all(sources.map(async (source) => {
+    await Promise.all(sources.map(async (source: any) => {
         try {
             await learningService.deleteSource(source.id);
         } catch (error) {
             console.error(`Failed to delete source ${source.id} during conversation deletion:`, error);
-            // Continue deleting other sources and the conversation even if one file fails
         }
     }));
 
-    // 3. Delete the conversation
     await chatService.deleteConversation(paramsResult.data.conversationId);
 
     return new NextResponse(null, { status: 204 });

@@ -15,6 +15,7 @@ import { validateFileType, validateFileSize, generateContentHash } from '@/lib/f
 import { ValidationError, ConflictError, ExternalServiceError } from '@/lib/errors';
 import { setRequestUserId } from '@/lib/request-context';
 import type { ListSourcesResponse, UploadFileResponse } from '@/types/learning';
+import { storage } from '@/lib/storage';
 
 // =============================================================================
 // Initialize Queue Processor (Lazy)
@@ -26,11 +27,7 @@ function ensureQueueInitialized() {
     if (queueInitialized) return;
 
     initializeQueue(async (job) => {
-        // Dynamic import to avoid circular dependencies
-        const { createClient } = await import('@/lib/supabase/server');
-        const supabase = await createClient();
-
-        const learningService = new LearningService(supabase, job.user_id);
+        const learningService = new LearningService(job.user_id);
         await learningService.processSource(job.source_id);
     });
 
@@ -44,7 +41,7 @@ function ensureQueueInitialized() {
 export const GET = withApiHandler(async (request: NextRequest): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const searchParams = request.nextUrl.searchParams;
     const queryResult = listSourcesQuerySchema.safeParse({
@@ -57,11 +54,11 @@ export const GET = withApiHandler(async (request: NextRequest): Promise<NextResp
         throw new ValidationError('Validation failed', queryResult.error.flatten());
     }
 
-    const learningService = new LearningService(auth.supabase, auth.user.id);
+    const learningService = new LearningService(auth.userId);
     const sources = await learningService.listSources(
         queryResult.data.conversation_id,
         {
-            status: queryResult.data.status,
+            status: queryResult.data.status as any,
             limit: queryResult.data.limit,
         }
     );
@@ -82,9 +79,9 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
 
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
-    const rateLimitError = await checkRateLimit(auth.user.id, 'upload');
+    const rateLimitError = await checkRateLimit(auth.userId, 'upload');
     if (rateLimitError) return rateLimitError;
 
     const formData = await request.formData();
@@ -128,7 +125,7 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
 
     // Check for duplicate (by hash)
     const contentHash = await generateContentHash(buffer);
-    const learningService = new LearningService(auth.supabase, auth.user.id);
+    const learningService = new LearningService(auth.userId);
 
     const duplicate = await learningService.checkDuplicate(
         conversationResult.data.conversation_id,
@@ -143,12 +140,7 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
         file.name
     );
 
-    const { error: uploadError } = await auth.supabase.storage
-        .from('learning-files')
-        .upload(storagePath, buffer, {
-            contentType: fileValidation.mime_type,
-            upsert: false,
-        });
+    const { error: uploadError } = await storage.upload(storagePath, buffer);
 
     if (uploadError) {
         throw new ExternalServiceError('storage', uploadError as unknown as Error);
@@ -167,7 +159,7 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
     ensureQueueInitialized();
     await getProcessingQueue().add(
         source.id,
-        auth.user.id,
+        auth.userId,
         conversationResult.data.conversation_id
     );
 

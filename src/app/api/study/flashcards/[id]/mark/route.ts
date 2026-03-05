@@ -28,7 +28,7 @@ export const PATCH = withApiHandler(async (
 ): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const id = context?.params?.id;
     if (!id || !/^[0-9a-f-]{36}$/i.test(id)) {
@@ -42,7 +42,7 @@ export const PATCH = withApiHandler(async (
         throw new ValidationError(errorMessage, validation.error.flatten());
     }
 
-    const flashcardService = new FlashcardService(auth.supabase, auth.user.id);
+    const flashcardService = new FlashcardService(auth.userId);
     const updated = await flashcardService.markFlashcard(id, validation.data.is_learned);
 
     return NextResponse.json<FlashcardRow>(updated);

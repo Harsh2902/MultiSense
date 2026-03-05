@@ -1,8 +1,9 @@
 // =============================================================================
-// Quiz Service - Generate and manage quizzes via RAG
+// Quiz Service - Generate and manage quizzes via RAG (Prisma)
 // =============================================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 import type {
     QuizRow,
     QuizQuestionRow,
@@ -11,6 +12,7 @@ import type {
     GeneratedQuizQuestion,
     QuizResponse,
     QuizAttemptResponse,
+    QuizStatus
 } from '@/types/study';
 import {
     STUDY_CONFIG,
@@ -29,15 +31,13 @@ import type { LLMProvider } from '@/types/ai.types';
 // =============================================================================
 
 export class QuizService {
-    private supabase: SupabaseClient;
     private userId: string;
     private ragService: RagService;
     private llm: LLMProvider;
 
-    constructor(supabase: SupabaseClient, userId: string) {
-        this.supabase = supabase;
+    constructor(userId: string) {
         this.userId = userId;
-        this.ragService = new RagService(supabase, userId);
+        this.ragService = new RagService(userId);
         this.llm = createLLMProvider();
     }
 
@@ -50,7 +50,7 @@ export class QuizService {
         topic?: string
     ): Promise<QuizResponse> {
         // 1. Rate limit check
-        await this.checkRateLimit(conversationId);
+        await this.checkRateLimit();
 
         // 2. Check for concurrent generation
         await this.checkConcurrentGeneration(conversationId);
@@ -75,20 +75,19 @@ export class QuizService {
         }
 
         // 5. Create quiz record (status: generating)
-        const { data: quiz, error: createError } = await this.supabase
-            .from('quizzes')
-            .insert({
-                user_id: this.userId,
-                conversation_id: conversationId,
-                title: topic ? `Quiz: ${topic}` : 'Quiz',
-                status: 'generating',
-                question_count: STUDY_CONFIG.QUIZ_QUESTION_COUNT,
-                metadata: { topic, contextTokens: context.tokenCount },
-            })
-            .select()
-            .single();
-
-        if (createError || !quiz) {
+        let quiz;
+        try {
+            quiz = await prisma.quiz.create({
+                data: {
+                    user_id: this.userId,
+                    conversation_id: conversationId,
+                    title: topic ? `Quiz: ${topic}` : 'Quiz',
+                    status: 'generating',
+                    question_count: STUDY_CONFIG.QUIZ_QUESTION_COUNT,
+                    metadata: { topic, contextTokens: context.tokenCount } as Prisma.JsonObject,
+                }
+            });
+        } catch (error) {
             throw new StudyToolError('Failed to create quiz', 'CREATE_FAILED');
         }
 
@@ -109,13 +108,14 @@ export class QuizService {
             }
 
             // 7b. Atomic budget enforcement
-            const debit = await debitTokenBudget(this.supabase, {
+            const debit = await debitTokenBudget({
                 userId: this.userId,
                 feature: 'quiz',
                 provider: 'groq',
                 inputTokens: promptTokens,
                 outputTokens: 4096, // Quiz JSON is typically large
             });
+
             if (!debit.allowed) {
                 await this.markQuizFailed(quiz.id);
                 throw new BudgetExceededError(debit);
@@ -157,39 +157,35 @@ export class QuizService {
 
             // 10. Store questions
             const chunkIds = context.chunks.map(c => c.id);
-            const { data: questions, error: qError } = await this.supabase
-                .from('quiz_questions')
-                .insert(
-                    validQuestions.map((q, i) => ({
-                        quiz_id: quiz.id,
-                        question_index: i,
-                        question_text: q.question,
-                        options: q.options,
-                        correct_option_index: q.correct_index,
-                        explanation: q.explanation || '',
-                        source_chunk_ids: chunkIds,
-                    }))
-                )
-                .select();
 
-            if (qError) {
-                await this.markQuizFailed(quiz.id);
-                throw new StudyToolError('Failed to store questions', 'STORE_FAILED');
-            }
+            await prisma.quizQuestion.createMany({
+                data: validQuestions.map((q, i) => ({
+                    quiz_id: quiz.id,
+                    question_index: i,
+                    question_text: q.question,
+                    options: q.options,
+                    correct_option_index: q.correct_index,
+                    explanation: q.explanation || '',
+                    source_chunk_ids: chunkIds,
+                }))
+            });
+
+            const questions = await prisma.quizQuestion.findMany({
+                where: { quiz_id: quiz.id },
+                orderBy: { question_index: 'asc' }
+            });
 
             // 11. Mark quiz ready
-            await this.supabase
-                .from('quizzes')
-                .update({
+            const updated = await prisma.quiz.update({
+                where: { id: quiz.id },
+                data: {
                     status: 'ready',
                     question_count: validQuestions.length,
-                    updated_at: new Date().toISOString(),
-                })
-                .eq('id', quiz.id);
+                }
+            });
 
-            const updatedQuiz = { ...quiz, status: 'ready' as const, question_count: validQuestions.length };
-
-            return { quiz: updatedQuiz, questions: questions || [] };
+            const returnedQuiz = { ...updated, status: updated.status as QuizStatus, created_at: updated.created_at.toISOString(), updated_at: updated.updated_at.toISOString() } as unknown as QuizRow;
+            return { quiz: returnedQuiz, questions: questions as unknown as QuizQuestionRow[] };
         } catch (error) {
             if (error instanceof StudyToolError) throw error;
             await this.markQuizFailed(quiz.id);
@@ -206,31 +202,26 @@ export class QuizService {
         answers: Array<{ question_id: string; selected_option_index: number }>
     ): Promise<QuizAttemptResponse> {
         // 1. Fetch quiz and verify ownership
-        const { data: quiz, error: quizError } = await this.supabase
-            .from('quizzes')
-            .select('*')
-            .eq('id', quizId)
-            .eq('user_id', this.userId)
-            .eq('status', 'ready')
-            .single();
+        const quiz = await prisma.quiz.findUnique({
+            where: { id: quizId, user_id: this.userId, status: 'ready' }
+        });
 
-        if (quizError || !quiz) {
+        if (!quiz) {
             throw new StudyToolError('Quiz not found or not ready', 'NOT_FOUND');
         }
 
         // 2. Fetch questions
-        const { data: questions, error: qError } = await this.supabase
-            .from('quiz_questions')
-            .select('*')
-            .eq('quiz_id', quizId)
-            .order('question_index', { ascending: true });
+        const questions = await prisma.quizQuestion.findMany({
+            where: { quiz_id: quizId },
+            orderBy: { question_index: 'asc' }
+        });
 
-        if (qError || !questions || questions.length === 0) {
+        if (!questions || questions.length === 0) {
             throw new StudyToolError('No questions found for quiz', 'NOT_FOUND');
         }
 
         // 3. Validate all questions answered
-        const questionMap = new Map<string, QuizQuestionRow>();
+        const questionMap = new Map<string, any>();
         for (const q of questions) {
             questionMap.set(q.id, q);
         }
@@ -262,40 +253,53 @@ export class QuizService {
             .sort((a, b) => a.question_id.localeCompare(b.question_id))
             .map(a => `${a.question_id}:${a.selected_option_index}`)
             .join('|');
+
         const answerHash = await this.computeHash(sortedAnswers);
 
-        // 6. Store attempt
-        const { data: attempt, error: attemptError } = await this.supabase
-            .from('quiz_attempts')
-            .insert({
+        // 5.5 Check duplicate deduplication physically via hash
+        const existingAttempt = await prisma.quizAttempt.findFirst({
+            where: {
                 quiz_id: quizId,
-                user_id: this.userId,
-                answers: attemptAnswers,
                 answer_hash: answerHash,
-                score: correctCount,
-                percentage,
-            })
-            .select()
-            .single();
-
-        if (attemptError) {
-            if (attemptError.code === '23505') {
-                throw new StudyToolError('Duplicate submission detected', 'DUPLICATE');
+                user_id: this.userId
             }
+        });
+
+        if (existingAttempt) {
+            throw new StudyToolError('Duplicate submission detected', 'DUPLICATE');
+        }
+
+        // 6. Store attempt
+        let attempt;
+        try {
+            attempt = await prisma.quizAttempt.create({
+                data: {
+                    quiz_id: quizId,
+                    user_id: this.userId,
+                    answers: attemptAnswers as any,
+                    answer_hash: answerHash,
+                    score: correctCount,
+                    percentage,
+                }
+            });
+        } catch (attemptError: any) {
             throw new StudyToolError('Failed to submit attempt', 'STORE_FAILED');
         }
 
         // 6. Build response
-        const results = questions.map((q: QuizQuestionRow) => {
+        const results = questions.map((q: any) => {
             const answer = attemptAnswers.find(a => a.question_id === q.id);
             return {
-                question: q,
+                question: q as unknown as QuizQuestionRow,
                 selected_option_index: answer?.selected_option_index ?? -1,
                 is_correct: answer?.is_correct ?? false,
             };
         });
 
-        return { attempt, quiz, results };
+        const returnedAttempt = { ...attempt, completed_at: attempt.completed_at.toISOString(), created_at: attempt.created_at.toISOString() } as unknown as QuizAttemptRow;
+        const returnedQuiz = { ...quiz, status: quiz.status as QuizStatus, created_at: quiz.created_at.toISOString(), updated_at: quiz.updated_at.toISOString() } as unknown as QuizRow;
+
+        return { attempt: returnedAttempt, quiz: returnedQuiz, results };
     }
 
     // ===========================================================================
@@ -303,40 +307,38 @@ export class QuizService {
     // ===========================================================================
 
     async getQuiz(quizId: string): Promise<QuizResponse> {
-        const { data: quiz, error: quizError } = await this.supabase
-            .from('quizzes')
-            .select('*')
-            .eq('id', quizId)
-            .eq('user_id', this.userId)
-            .single();
+        const quiz = await prisma.quiz.findUnique({
+            where: { id: quizId, user_id: this.userId }
+        });
 
-        if (quizError || !quiz) {
+        if (!quiz) {
             throw new StudyToolError('Quiz not found', 'NOT_FOUND');
         }
 
-        const { data: questions } = await this.supabase
-            .from('quiz_questions')
-            .select('*')
-            .eq('quiz_id', quizId)
-            .order('question_index', { ascending: true });
+        const questions = await prisma.quizQuestion.findMany({
+            where: { quiz_id: quizId },
+            orderBy: { question_index: 'asc' }
+        });
 
-        return { quiz, questions: questions || [] };
+        const returnedQuiz = { ...quiz, status: quiz.status as QuizStatus, created_at: quiz.created_at.toISOString(), updated_at: quiz.updated_at.toISOString() } as unknown as QuizRow;
+        return { quiz: returnedQuiz, questions: questions as unknown as QuizQuestionRow[] };
     }
 
     // ===========================================================================
     // Helpers
     // ===========================================================================
 
-    private async checkRateLimit(conversationId: string): Promise<void> {
-        const oneHourAgo = new Date(Date.now() - 3600_000).toISOString();
+    private async checkRateLimit(): Promise<void> {
+        const oneHourAgo = new Date(Date.now() - 3600_000);
 
-        const { count } = await this.supabase
-            .from('quizzes')
-            .select('*', { count: 'exact', head: true })
-            .eq('user_id', this.userId)
-            .gte('created_at', oneHourAgo);
+        const count = await prisma.quiz.count({
+            where: {
+                user_id: this.userId,
+                created_at: { gte: oneHourAgo }
+            }
+        });
 
-        if ((count ?? 0) >= STUDY_CONFIG.GENERATION_RATE_LIMIT_PER_HOUR) {
+        if (count >= STUDY_CONFIG.GENERATION_RATE_LIMIT_PER_HOUR) {
             throw new StudyToolError(
                 'Rate limit exceeded. Please wait before generating more quizzes.',
                 'RATE_LIMITED'
@@ -345,15 +347,16 @@ export class QuizService {
     }
 
     private async checkConcurrentGeneration(conversationId: string): Promise<void> {
-        const { data } = await this.supabase
-            .from('quizzes')
-            .select('id')
-            .eq('user_id', this.userId)
-            .eq('conversation_id', conversationId)
-            .eq('status', 'generating')
-            .limit(1);
+        const concurrent = await prisma.quiz.findFirst({
+            where: {
+                user_id: this.userId,
+                conversation_id: conversationId,
+                status: 'generating'
+            },
+            select: { id: true }
+        });
 
-        if (data && data.length > 0) {
+        if (concurrent) {
             throw new StudyToolError(
                 'A quiz is already being generated for this conversation',
                 'CONCURRENT_GENERATION'
@@ -362,10 +365,10 @@ export class QuizService {
     }
 
     private async markQuizFailed(quizId: string): Promise<void> {
-        await this.supabase
-            .from('quizzes')
-            .update({ status: 'failed', updated_at: new Date().toISOString() })
-            .eq('id', quizId);
+        await prisma.quiz.update({
+            where: { id: quizId },
+            data: { status: 'failed' }
+        });
     }
 
     /**

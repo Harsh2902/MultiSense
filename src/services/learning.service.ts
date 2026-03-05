@@ -1,9 +1,10 @@
 // =============================================================================
-// Learning Service - File processing and learning source management
+// Learning Service - File processing and learning source management (Prisma)
 // =============================================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Database } from '@/types/database';
+import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
+import { storage } from '@/lib/storage';
 import type {
     LearningSourceRow,
     LearningSourceMetadata,
@@ -24,10 +25,6 @@ import {
     chunkText,
 } from '@/lib/files';
 
-// =============================================================================
-// Types
-// =============================================================================
-
 export interface CreateSourceOptions {
     conversation_id: string;
     original_filename: string;
@@ -43,40 +40,14 @@ export interface ProcessingResult {
     error?: string;
 }
 
-// =============================================================================
-// Learning Service Class
-// =============================================================================
-
-/**
- * Service for managing learning sources and file processing
- * 
- * Responsibilities:
- * - Learning source CRUD operations
- * - File processing orchestration
- * - Chunk management
- * - Duplicate detection
- * - Status tracking
- */
 export class LearningService {
-    constructor(
-        private readonly supabase: SupabaseClient<any>,
-        private readonly userId: string
-    ) { }
+    constructor(private readonly userId: string) { }
 
-    // ===========================================================================
-    // Learning Source CRUD
-    // ===========================================================================
-
-    /**
-     * Create a new learning source (pending processing)
-     */
     async createSource(options: CreateSourceOptions): Promise<LearningSourceRow> {
-        // Generate title from filename
         const title = this.generateTitle(options.original_filename);
 
-        const { data, error } = await this.supabase
-            .from('learning_sources')
-            .insert({
+        const data = await prisma.learningSource.create({
+            data: {
                 user_id: this.userId,
                 conversation_id: options.conversation_id,
                 source_type: 'file',
@@ -85,214 +56,120 @@ export class LearningService {
                 file_type: options.file_type,
                 file_size: options.file_size,
                 storage_path: options.storage_path,
-                status: 'pending' as ProcessingStatus,
-                metadata: {
-                    mime_type: options.mime_type,
-                } as any,
-            })
-            .select()
-            .single();
+                status: 'pending',
+                metadata: { mime_type: options.mime_type } as Prisma.JsonObject,
+            }
+        });
 
-        if (error) {
-            throw new Error(`Failed to create source: ${error.message}`);
-        }
-
-        return data as LearningSourceRow;
+        return { ...data, created_at: data.created_at.toISOString(), updated_at: data.updated_at.toISOString(), conversation_id: data.conversation_id || null } as unknown as LearningSourceRow;
     }
 
-    /**
-     * Get learning source by ID
-     * RLS ensures user can only access their own sources
-     */
     async getSource(sourceId: string): Promise<LearningSourceRow | null> {
-        const { data, error } = await this.supabase
-            .from('learning_sources')
-            .select('*')
-            .eq('id', sourceId)
-            .single();
+        const data = await prisma.learningSource.findUnique({
+            where: { id: sourceId, user_id: this.userId }
+        });
 
-        if (error) {
-            if (error.code === 'PGRST116') return null; // Not found
-            throw new Error(`Failed to get source: ${error.message}`);
-        }
+        if (!data) return null;
 
-        return data as LearningSourceRow;
+        return { ...data, created_at: data.created_at.toISOString(), updated_at: data.updated_at.toISOString(), conversation_id: data.conversation_id || null } as unknown as LearningSourceRow;
     }
 
-    /**
-     * List learning sources for a conversation
-     */
     async listSources(
         conversationId?: string,
         options?: { status?: ProcessingStatus; limit?: number }
     ): Promise<LearningSourceRow[]> {
-        let query = this.supabase
-            .from('learning_sources')
-            .select('*')
-            .eq('user_id', this.userId)
-            .order('created_at', { ascending: false })
-            .limit(options?.limit ?? 50);
+        const limit = options?.limit ?? 50;
 
-        if (conversationId) {
-            query = query.eq('conversation_id', conversationId);
-        }
+        const where: Prisma.LearningSourceWhereInput = {
+            user_id: this.userId,
+            ...(conversationId ? { conversation_id: conversationId } : {}),
+            ...(options?.status ? { status: options.status } : {}),
+        };
 
-        if (options?.status) {
-            query = query.eq('status', options.status);
-        }
+        const data = await prisma.learningSource.findMany({
+            where,
+            take: limit,
+            orderBy: { created_at: 'desc' },
+        });
 
-        const { data, error } = await query;
-
-        if (error) {
-            throw new Error(`Failed to list sources: ${error.message}`);
-        }
-
-        return (data ?? []) as LearningSourceRow[];
+        return data.map(d => ({ ...d, created_at: d.created_at.toISOString(), updated_at: d.updated_at.toISOString(), conversation_id: d.conversation_id || null })) as unknown as LearningSourceRow[];
     }
 
-    /**
-     * Update learning source status
-     */
     async updateSourceStatus(
         sourceId: string,
         status: ProcessingStatus,
         metadata?: Partial<LearningSourceMetadata>,
         error_message?: string
     ): Promise<void> {
-        const updates: Record<string, unknown> = {
+        const updates: Prisma.LearningSourceUpdateInput = {
             status,
-            updated_at: new Date().toISOString(),
         };
 
         if (error_message !== undefined) {
-            updates['error_message'] = error_message;
+            updates.error_message = error_message;
         }
 
-        // Merge metadata if provided
         if (metadata) {
             const existing = await this.getSource(sourceId);
-            updates['metadata'] = {
-                ...(existing?.metadata ?? {}),
+            updates.metadata = {
+                ...(existing?.metadata as Record<string, unknown> ?? {}),
                 ...metadata,
-            };
+            } as Prisma.JsonObject;
         }
 
-        const { error } = await this.supabase
-            .from('learning_sources')
-            .update(updates)
-            .eq('id', sourceId);
-
-        if (error) {
-            throw new Error(`Failed to update source: ${error.message}`);
-        }
+        await prisma.learningSource.update({
+            where: { id: sourceId, user_id: this.userId },
+            data: updates
+        });
     }
 
-    /**
-     * Delete learning source and associated data
-     */
     async deleteSource(sourceId: string): Promise<void> {
-        // Get source to find storage path
         const source = await this.getSource(sourceId);
-        if (!source) {
+        if (!source || source.user_id !== this.userId) {
             throw new Error('Source not found');
         }
 
-        // Verify ownership (defense-in-depth)
-        if (source.user_id !== this.userId) {
-            throw new Error('Source not found');
-        }
-
-        // Delete from storage
         if (source.storage_path) {
-            await this.supabase.storage
-                .from('learning-files')
-                .remove([source.storage_path]);
+            await storage.remove([source.storage_path]);
         }
 
-        // Delete chunks (cascade should handle this, but explicit for safety)
-        await this.supabase
-            .from('source_chunks')
-            .delete()
-            .eq('source_id', sourceId);
-
-        // Delete source
-        const { error } = await this.supabase
-            .from('learning_sources')
-            .delete()
-            .eq('id', sourceId);
-
-        if (error) {
-            throw new Error(`Failed to delete source: ${error.message}`);
-        }
+        // Deleting the source will implicitly cascade delete chunks due to onDelete: Cascade on Prisma schema
+        await prisma.learningSource.delete({
+            where: { id: sourceId }
+        });
     }
 
-    // ===========================================================================
-    // Duplicate Detection
-    // ===========================================================================
-
-    /**
-     * Check if file content already exists (by hash)
-     * Prevents duplicate processing of same file
-     */
     async checkDuplicate(
         conversationId: string,
         contentHash: string
     ): Promise<LearningSourceRow | null> {
-        const { data, error } = await this.supabase
-            .from('learning_sources')
-            .select('*')
-            .eq('user_id', this.userId)
-            .eq('conversation_id', conversationId)
-            .contains('metadata', { hash: contentHash })
-            .limit(1);
+        const data = await prisma.learningSource.findFirst({
+            where: {
+                user_id: this.userId,
+                conversation_id: conversationId,
+                metadata: { path: ['hash'], equals: contentHash }
+            }
+        });
 
-        if (error) {
-            console.error('Duplicate check failed:', error);
-            return null;
-        }
-
-        return (data?.[0] as LearningSourceRow) ?? null;
+        return data ? { ...data, created_at: data.created_at.toISOString(), updated_at: data.updated_at.toISOString(), conversation_id: data.conversation_id || null } as unknown as LearningSourceRow : null;
     }
 
-    // ===========================================================================
-    // File Processing
-    // ===========================================================================
-
-    /**
-     * Process a source file
-     * Extracts text, normalizes, chunks, and saves
-     * 
-     * RACE CONDITION PREVENTION:
-     * - Atomically set status to 'processing' with check
-     * - If already processing, return early
-     */
     async processSource(sourceId: string): Promise<ProcessingResult> {
         const startTime = Date.now();
 
-        // 1. Atomically claim processing (prevent double processing)
-        const { data: claimed, error: claimError } = await this.supabase
-            .from('learning_sources')
-            .update({
-                status: 'processing' as ProcessingStatus,
-                updated_at: new Date().toISOString(),
-            })
-            .eq('id', sourceId)
-            .eq('status', 'pending') // Only if currently pending
-            .select()
-            .single();
-
-        if (claimError || !claimed) {
-            // Either not found, not pending, or already processing
-            return { success: false, chunks_created: 0, error: 'Source not available for processing' };
-        }
-
-        const source = claimed as LearningSourceRow;
-
         try {
+            // 1. Atomically claim processing
+            const claimed = await prisma.learningSource.update({
+                where: { id: sourceId, status: 'pending' },
+                data: { status: 'processing' }
+            });
+
+            const source = { ...claimed, created_at: claimed.created_at.toISOString(), updated_at: claimed.updated_at.toISOString() } as unknown as LearningSourceRow;
+
             // 2. Download file from storage
-            const { data: fileData, error: downloadError } = await this.supabase.storage
-                .from('learning-files')
-                .download(source.storage_path!);
+            if (!source.storage_path) throw new Error("No storage path provided for source");
+
+            const { data: fileData, error: downloadError } = await storage.download(source.storage_path);
 
             if (downloadError || !fileData) {
                 throw new Error(`Failed to download file: ${downloadError?.message}`);
@@ -304,11 +181,12 @@ export class LearningService {
             const hash = await generateContentHash(buffer);
 
             // 4. Check for duplicate
-            const duplicate = await this.checkDuplicate(source.conversation_id, hash);
-            if (duplicate && duplicate.id !== sourceId) {
-                await this.updateSourceStatus(sourceId, 'failed', undefined,
-                    'Duplicate file already processed');
-                return { success: false, chunks_created: 0, error: 'Duplicate file' };
+            if (source.conversation_id) {
+                const duplicate = await this.checkDuplicate(source.conversation_id, hash);
+                if (duplicate && duplicate.id !== sourceId) {
+                    await this.updateSourceStatus(sourceId, 'failed', undefined, 'Duplicate file already processed');
+                    return { success: false, chunks_created: 0, error: 'Duplicate file' };
+                }
             }
 
             // 5. Extract text
@@ -340,27 +218,24 @@ export class LearningService {
             return { success: true, chunks_created: chunking.chunks.length };
 
         } catch (error) {
-            // Update source with failure
-            const errorMessage = error instanceof Error ? error.message : 'Processing failed';
+            // Prisma will throw error if trying to update but it is NOT `pending` in the condition.
+            if ((error as any).code === 'P2025') {
+                return { success: false, chunks_created: 0, error: 'Source not available for processing' };
+            }
 
-            // Increment retry count
+            const existingSource = await this.getSource(sourceId);
+            if (!existingSource) return { success: false, chunks_created: 0, error: 'Source not found' };
+
+            const errorMessage = error instanceof Error ? error.message : 'Processing failed';
             const metadata: Partial<LearningSourceMetadata> = {
-                retry_count: ((source.metadata as LearningSourceMetadata)?.retry_count ?? 0) + 1,
+                retry_count: ((existingSource.metadata as LearningSourceMetadata)?.retry_count ?? 0) + 1,
             };
 
             await this.updateSourceStatus(sourceId, 'failed', metadata, errorMessage);
-
             return { success: false, chunks_created: 0, error: errorMessage };
         }
     }
 
-    // ===========================================================================
-    // Chunk Management
-    // ===========================================================================
-
-    /**
-     * Save chunks for a source
-     */
     private async saveChunks(
         sourceId: string,
         chunks: Array<{ content: string; token_count: number; metadata: ChunkMetadata }>
@@ -372,53 +247,33 @@ export class LearningService {
             chunk_index: index,
             content: chunk.content,
             token_count: chunk.token_count,
-            metadata: chunk.metadata as any,
+            metadata: chunk.metadata as Prisma.JsonObject,
         }));
 
-        // Insert in batches to avoid payload limits
-        const BATCH_SIZE = 100;
-        for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-            const batch = rows.slice(i, i + BATCH_SIZE);
-            const { error } = await this.supabase
-                .from('source_chunks')
-                .insert(batch);
-
-            if (error) {
-                throw new Error(`Failed to save chunks: ${error.message}`);
-            }
-        }
+        await prisma.sourceChunk.createMany({
+            data: rows
+        });
     }
 
-    /**
-     * Get chunks for a source
-     */
     async getChunks(sourceId: string): Promise<SourceChunkRow[]> {
-        const { data, error } = await this.supabase
-            .from('source_chunks')
-            .select('*')
-            .eq('source_id', sourceId)
-            .order('chunk_index', { ascending: true });
+        const data = await prisma.sourceChunk.findMany({
+            where: { source_id: sourceId },
+            orderBy: { chunk_index: 'asc' }
+        });
 
-        if (error) {
-            throw new Error(`Failed to get chunks: ${error.message}`);
-        }
-
-        return (data ?? []) as SourceChunkRow[];
+        // The chunk currently has vector field. So we do simple mapping.
+        return data.map(c => ({
+            id: c.id,
+            source_id: c.source_id,
+            chunk_index: c.chunk_index,
+            content: c.content,
+            token_count: c.token_count,
+            embedding: null, // Embeddings handles separately using raw queries in PGVector
+            metadata: c.metadata as ChunkMetadata,
+            created_at: c.created_at.toISOString()
+        })) as SourceChunkRow[];
     }
 
-    // ===========================================================================
-    // Storage Path Generation
-    // ===========================================================================
-
-    /**
-     * Generate storage path for user file
-     * Structure: {user_id}/{conversation_id}/{timestamp}_{filename}
-     * 
-     * This ensures:
-     * - User isolation (each user has their own folder)
-     * - Conversation grouping
-     * - Unique filenames via timestamp
-     */
     generateStoragePath(
         conversationId: string,
         filename: string
@@ -428,23 +283,13 @@ export class LearningService {
         return `${this.userId}/${conversationId}/${timestamp}_${sanitized}`;
     }
 
-    // ===========================================================================
-    // Helpers
-    // ===========================================================================
-
-    /**
-     * Generate title from filename
-     */
     private generateTitle(filename: string): string {
-        // Remove extension
         const withoutExt = filename.replace(/\.[^.]+$/, '');
-        // Replace underscores/dashes with spaces
         const spaced = withoutExt.replace(/[_-]/g, ' ');
-        // Capitalize first letter of each word
         return spaced
             .split(' ')
             .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
             .join(' ')
-            .slice(0, 100); // Limit length
+            .slice(0, 100);
     }
 }

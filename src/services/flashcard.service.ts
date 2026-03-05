@@ -1,13 +1,15 @@
 // =============================================================================
-// Flashcard Service - Generate and manage flashcards via RAG
+// Flashcard Service - Generate and manage flashcards via RAG (Prisma)
 // =============================================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 import type {
     FlashcardSetRow,
     FlashcardRow,
     GeneratedFlashcard,
     FlashcardSetResponse,
+    FlashcardSetStatus
 } from '@/types/study';
 import {
     STUDY_CONFIG,
@@ -27,15 +29,13 @@ import { StudyToolError } from '@/services/quiz.service';
 // =============================================================================
 
 export class FlashcardService {
-    private supabase: SupabaseClient;
     private userId: string;
     private ragService: RagService;
     private llm: LLMProvider;
 
-    constructor(supabase: SupabaseClient, userId: string) {
-        this.supabase = supabase;
+    constructor(userId: string) {
         this.userId = userId;
-        this.ragService = new RagService(supabase, userId);
+        this.ragService = new RagService(userId);
         this.llm = createLLMProvider();
     }
 
@@ -73,20 +73,19 @@ export class FlashcardService {
         }
 
         // 5. Create flashcard set (status: generating)
-        const { data: set, error: createError } = await this.supabase
-            .from('flashcard_sets')
-            .insert({
-                user_id: this.userId,
-                conversation_id: conversationId,
-                title: topic ? `Flashcards: ${topic}` : 'Flashcards',
-                status: 'generating',
-                card_count: STUDY_CONFIG.FLASHCARD_COUNT,
-                metadata: { topic, contextTokens: context.tokenCount },
-            })
-            .select()
-            .single();
-
-        if (createError || !set) {
+        let set;
+        try {
+            set = await prisma.flashcardSet.create({
+                data: {
+                    user_id: this.userId,
+                    conversation_id: conversationId,
+                    title: topic ? `Flashcards: ${topic}` : 'Flashcards',
+                    status: 'generating',
+                    card_count: STUDY_CONFIG.FLASHCARD_COUNT,
+                    metadata: { topic, contextTokens: context.tokenCount } as Prisma.JsonObject,
+                }
+            });
+        } catch (error) {
             throw new StudyToolError('Failed to create flashcard set', 'CREATE_FAILED');
         }
 
@@ -107,7 +106,7 @@ export class FlashcardService {
             }
 
             // 7b. Atomic budget enforcement
-            const debit = await debitTokenBudget(this.supabase, {
+            const debit = await debitTokenBudget({
                 userId: this.userId,
                 feature: 'flashcard',
                 provider: 'groq',
@@ -148,39 +147,36 @@ export class FlashcardService {
 
             // 10. Store flashcards
             const chunkIds = context.chunks.map(c => c.id);
-            const { data: cards, error: cError } = await this.supabase
-                .from('flashcards')
-                .insert(
-                    validCards.map((c, i) => ({
-                        set_id: set.id,
-                        card_index: i,
-                        front: c.front,
-                        back: c.back,
-                        is_learned: false,
-                        review_count: 0,
-                        source_chunk_ids: chunkIds,
-                    }))
-                )
-                .select();
 
-            if (cError) {
-                await this.markSetFailed(set.id);
-                throw new StudyToolError('Failed to store flashcards', 'STORE_FAILED');
-            }
+            await prisma.flashcard.createMany({
+                data: validCards.map((c, i) => ({
+                    set_id: set.id,
+                    card_index: i,
+                    front: c.front,
+                    back: c.back,
+                    is_learned: false,
+                    review_count: 0,
+                    source_chunk_ids: chunkIds,
+                }))
+            });
+
+            const cards = await prisma.flashcard.findMany({
+                where: { set_id: set.id },
+                orderBy: { card_index: 'asc' }
+            });
 
             // 11. Mark set ready
-            await this.supabase
-                .from('flashcard_sets')
-                .update({
+            const updated = await prisma.flashcardSet.update({
+                where: { id: set.id },
+                data: {
                     status: 'ready',
                     card_count: validCards.length,
-                    updated_at: new Date().toISOString(),
-                })
-                .eq('id', set.id);
+                }
+            });
 
-            const updatedSet = { ...set, status: 'ready' as const, card_count: validCards.length };
+            const returnedSet = { ...updated, status: updated.status as FlashcardSetStatus, created_at: updated.created_at.toISOString(), updated_at: updated.updated_at.toISOString() } as unknown as FlashcardSetRow;
 
-            return { set: updatedSet, cards: cards || [] };
+            return { set: returnedSet, cards: cards as unknown as FlashcardRow[] };
         } catch (error) {
             if (error instanceof StudyToolError) throw error;
             await this.markSetFailed(set.id);
@@ -197,36 +193,28 @@ export class FlashcardService {
         isLearned: boolean
     ): Promise<FlashcardRow> {
         // 1. Verify ownership via RLS (join through set)
-        const { data: card, error: fetchError } = await this.supabase
-            .from('flashcards')
-            .select(`
-        *,
-        flashcard_sets!inner(user_id)
-      `)
-            .eq('id', flashcardId)
-            .single();
+        const card = await prisma.flashcard.findUnique({
+            where: { id: flashcardId },
+            include: {
+                set: { select: { user_id: true } }
+            }
+        });
 
-        if (fetchError || !card) {
+        if (!card || card.set.user_id !== this.userId) {
             throw new StudyToolError('Flashcard not found', 'NOT_FOUND');
         }
 
         // 2. Update card
-        const { data: updated, error: updateError } = await this.supabase
-            .from('flashcards')
-            .update({
+        const updated = await prisma.flashcard.update({
+            where: { id: flashcardId },
+            data: {
                 is_learned: isLearned,
-                review_count: (card.review_count || 0) + 1,
-                last_reviewed_at: new Date().toISOString(),
-            })
-            .eq('id', flashcardId)
-            .select()
-            .single();
+                review_count: { increment: 1 },
+                last_reviewed_at: new Date(),
+            }
+        });
 
-        if (updateError || !updated) {
-            throw new StudyToolError('Failed to update flashcard', 'UPDATE_FAILED');
-        }
-
-        return updated;
+        return { ...updated, created_at: updated.created_at.toISOString(), last_reviewed_at: updated.last_reviewed_at?.toISOString() ?? null } as unknown as FlashcardRow;
     }
 
     // ===========================================================================
@@ -234,26 +222,30 @@ export class FlashcardService {
     // ===========================================================================
 
     async getFlashcardSets(conversationId: string): Promise<FlashcardSetResponse[]> {
-        const { data: sets } = await this.supabase
-            .from('flashcard_sets')
-            .select('*')
-            .eq('user_id', this.userId)
-            .eq('conversation_id', conversationId)
-            .eq('status', 'ready')
-            .order('created_at', { ascending: false });
+        const sets = await prisma.flashcardSet.findMany({
+            where: {
+                user_id: this.userId,
+                conversation_id: conversationId,
+                status: 'ready'
+            },
+            orderBy: { created_at: 'desc' },
+            include: {
+                flashcards: {
+                    orderBy: { card_index: 'asc' }
+                }
+            }
+        });
 
         if (!sets || sets.length === 0) return [];
 
-        const results: FlashcardSetResponse[] = [];
-        for (const set of sets) {
-            const { data: cards } = await this.supabase
-                .from('flashcards')
-                .select('*')
-                .eq('set_id', set.id)
-                .order('card_index', { ascending: true });
-
-            results.push({ set, cards: cards || [] });
-        }
+        const results: FlashcardSetResponse[] = sets.map((s: any) => ({
+            set: { ...s, status: s.status as FlashcardSetStatus, created_at: s.created_at.toISOString(), updated_at: s.updated_at.toISOString() } as unknown as FlashcardSetRow,
+            cards: s.flashcards.map((c: any) => ({
+                ...c,
+                created_at: c.created_at.toISOString(),
+                last_reviewed_at: c.last_reviewed_at?.toISOString() ?? null
+            })) as unknown as FlashcardRow[]
+        }));
 
         return results;
     }
@@ -263,14 +255,16 @@ export class FlashcardService {
     // ===========================================================================
 
     private async checkRateLimit(): Promise<void> {
-        const oneHourAgo = new Date(Date.now() - 3600_000).toISOString();
-        const { count } = await this.supabase
-            .from('flashcard_sets')
-            .select('*', { count: 'exact', head: true })
-            .eq('user_id', this.userId)
-            .gte('created_at', oneHourAgo);
+        const oneHourAgo = new Date(Date.now() - 3600_000);
 
-        if ((count ?? 0) >= STUDY_CONFIG.GENERATION_RATE_LIMIT_PER_HOUR) {
+        const count = await prisma.flashcardSet.count({
+            where: {
+                user_id: this.userId,
+                created_at: { gte: oneHourAgo }
+            }
+        });
+
+        if (count >= STUDY_CONFIG.GENERATION_RATE_LIMIT_PER_HOUR) {
             throw new StudyToolError(
                 'Rate limit exceeded. Please wait before generating more flashcards.',
                 'RATE_LIMITED'
@@ -279,15 +273,16 @@ export class FlashcardService {
     }
 
     private async checkConcurrentGeneration(conversationId: string): Promise<void> {
-        const { data } = await this.supabase
-            .from('flashcard_sets')
-            .select('id')
-            .eq('user_id', this.userId)
-            .eq('conversation_id', conversationId)
-            .eq('status', 'generating')
-            .limit(1);
+        const concurrent = await prisma.flashcardSet.findFirst({
+            where: {
+                user_id: this.userId,
+                conversation_id: conversationId,
+                status: 'generating'
+            },
+            select: { id: true }
+        });
 
-        if (data && data.length > 0) {
+        if (concurrent) {
             throw new StudyToolError(
                 'Flashcards are already being generated for this conversation',
                 'CONCURRENT_GENERATION'
@@ -296,9 +291,9 @@ export class FlashcardService {
     }
 
     private async markSetFailed(setId: string): Promise<void> {
-        await this.supabase
-            .from('flashcard_sets')
-            .update({ status: 'failed', updated_at: new Date().toISOString() })
-            .eq('id', setId);
+        await prisma.flashcardSet.update({
+            where: { id: setId },
+            data: { status: 'failed' }
+        });
     }
 }

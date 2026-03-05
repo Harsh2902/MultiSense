@@ -31,7 +31,7 @@ export const GET = withApiHandler(async (
 ): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const params = await context.params;
     const paramsResult = getConversationParamsSchema.safeParse(params);
@@ -50,7 +50,7 @@ export const GET = withApiHandler(async (
         throw new ValidationError('Validation failed', queryResult.error.flatten());
     }
 
-    const chatService = new ChatService(auth.supabase, auth.user.id);
+    const chatService = new ChatService(auth.userId);
     const conversation = await chatService.getConversation(paramsResult.data.conversationId);
     if (!conversation) {
         throw new NotFoundError('Conversation', paramsResult.data.conversationId);

@@ -92,16 +92,11 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 async function checkDatabase(): Promise<HealthCheck> {
     try {
         const start = performance.now();
-        const { createClient } = await import('@/lib/supabase/server');
-        const supabase = await createClient();
+        const { prisma } = await import('@/lib/prisma');
 
-        const { error } = await supabase.from('conversations').select('id').limit(1);
+        await prisma.conversation.findFirst({ select: { id: true } });
 
         const durationMs = Math.round(performance.now() - start);
-
-        if (error) {
-            return { status: 'error', message: error.message, durationMs };
-        }
 
         return {
             status: durationMs > 2000 ? 'degraded' : 'ok',
@@ -118,9 +113,9 @@ async function checkDatabase(): Promise<HealthCheck> {
 
 function checkEnvironment(): HealthCheck {
     const required = [
-        'NEXT_PUBLIC_SUPABASE_URL',
-        'NEXT_PUBLIC_SUPABASE_ANON_KEY',
-        'SUPABASE_SERVICE_ROLE_KEY',
+        'DATABASE_URL',
+        'NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY',
+        'CLERK_SECRET_KEY',
     ];
 
     const missing = required.filter(key => !process.env[key]);

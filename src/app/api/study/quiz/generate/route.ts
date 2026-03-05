@@ -9,6 +9,7 @@ import type { QuizResponse } from '@/types/study';
 import { ValidationError, NotFoundError } from '@/lib/errors';
 import { setRequestUserId } from '@/lib/request-context';
 import { z } from 'zod';
+import { prisma } from '@/lib/prisma';
 
 // =============================================================================
 // Validation
@@ -26,7 +27,7 @@ const generateQuizSchema = z.object({
 export const POST = withApiHandler(async (request: NextRequest): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const body = await request.json();
     const validation = generateQuizSchema.safeParse(body);
@@ -38,18 +39,16 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
     const { conversation_id, topic } = validation.data;
 
     // Verify conversation ownership
-    const { data: conv, error: convError } = await auth.supabase
-        .from('conversations')
-        .select('id')
-        .eq('id', conversation_id)
-        .eq('user_id', auth.user.id)
-        .single();
+    const conv = await prisma.conversation.findUnique({
+        where: { id: conversation_id },
+        select: { user_id: true }
+    });
 
-    if (convError || !conv) {
+    if (!conv || conv.user_id !== auth.userId) {
         throw new NotFoundError('Conversation', conversation_id);
     }
 
-    const quizService = new QuizService(auth.supabase, auth.user.id);
+    const quizService = new QuizService(auth.userId);
     const result = await quizService.generateQuiz(conversation_id, topic);
 
     return NextResponse.json<QuizResponse>(result, { status: 201 });

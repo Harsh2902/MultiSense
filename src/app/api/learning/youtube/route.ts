@@ -9,6 +9,7 @@ import { ValidationError, NotFoundError } from '@/lib/errors';
 import { setRequestUserId } from '@/lib/request-context';
 import type { SubmitYouTubeResponse } from '@/types/youtube';
 import { z } from 'zod';
+import { prisma } from '@/lib/prisma';
 
 // =============================================================================
 // Validation Schema
@@ -26,7 +27,7 @@ const submitYouTubeSchema = z.object({
 export const POST = withApiHandler(async (request: NextRequest): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const body = await request.json();
     const validation = submitYouTubeSchema.safeParse(body);
@@ -38,27 +39,25 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
     const { url, conversation_id } = validation.data;
 
     // Verify conversation ownership
-    const { data: conversation, error: convError } = await auth.supabase
-        .from('conversations')
-        .select('id')
-        .eq('id', conversation_id)
-        .eq('user_id', auth.user.id)
-        .single();
+    const conversation = await prisma.conversation.findUnique({
+        where: { id: conversation_id, user_id: auth.userId },
+        select: { id: true }
+    });
 
-    if (convError || !conversation) {
+    if (!conversation) {
         throw new NotFoundError('Conversation', conversation_id);
     }
 
     try {
         // Submit video (YouTubeError will be caught by normalizeError)
-        const youtubeService = new YouTubeService(auth.supabase, auth.user.id);
+        const youtubeService = new YouTubeService(auth.userId);
         const { source, metadata } = await youtubeService.submitVideo(url, conversation_id);
 
         return NextResponse.json<SubmitYouTubeResponse>({
             source: {
                 id: source.id,
                 title: metadata.title,
-                status: source.status,
+                status: source.status as any,
                 videoId: metadata.videoId,
                 duration: metadata.durationSeconds,
             },

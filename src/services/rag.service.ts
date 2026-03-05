@@ -1,8 +1,9 @@
 // =============================================================================
-// RAG Service - Retrieval-Augmented Generation
+// RAG Service - Retrieval-Augmented Generation (Prisma)
 // =============================================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 import type {
     RetrievalConfig,
     RetrievedChunk,
@@ -25,14 +26,12 @@ import { EmbeddingService } from '@/lib/embeddings';
  * Service for retrieval-augmented generation
  */
 export class RagService {
-    private supabase: SupabaseClient;
     private embeddingService: EmbeddingService;
     private userId: string;
 
-    constructor(supabase: SupabaseClient, userId: string) {
-        this.supabase = supabase;
+    constructor(userId: string) {
         this.userId = userId;
-        this.embeddingService = new EmbeddingService(supabase);
+        this.embeddingService = new EmbeddingService();
     }
 
     // ===========================================================================
@@ -56,20 +55,32 @@ export class RagService {
         // 1. Generate query embedding
         const queryEmbedding = await this.embeddingService.embedQuery(query);
 
-        // 2. Search for matching chunks via RPC
-        const { data: matches, error } = await this.supabase.rpc('match_chunks', {
-            p_conversation_id: conversationId,
-            p_embedding: queryEmbedding,
-            p_threshold: cfg.threshold,
-            p_limit: cfg.k,
-        });
+        // 2. Search for matching chunks via Raw SQL pgvector
+        const vectorString = `[${queryEmbedding.join(',')}]`;
+        const matches = await prisma.$queryRaw<any[]>`
+            SELECT
+                c.id,
+                c.source_id,
+                c.content,
+                c.chunk_index,
+                1 - (c.embedding <=> ${vectorString}::vector) as similarity,
+                s.title as source_title,
+                s.original_filename as source_file_name,
+                s.source_type
+            FROM source_chunks c
+            JOIN learning_sources s ON c.source_id = s.id
+            WHERE s.conversation_id = ${conversationId}
+              AND 1 - (c.embedding <=> ${vectorString}::vector) > ${cfg.threshold}
+            ORDER BY c.embedding <=> ${vectorString}::vector
+            LIMIT ${cfg.k}
+        `;
 
-        if (error) {
-            throw new Error(`Failed to retrieve chunks: ${error.message}`);
+        if (!matches) {
+            throw new Error(`Failed to retrieve chunks`);
         }
 
         // 3. Convert to RetrievedChunk format
-        const rawChunks: RetrievedChunk[] = (matches || []).map((m: MatchChunkResult) => ({
+        const rawChunks: RetrievedChunk[] = matches.map((m: any) => ({
             id: m.id,
             sourceId: m.source_id,
             content: m.content,
@@ -276,8 +287,3 @@ export class RagService {
     }
 }
 
-// =============================================================================
-// Export
-// =============================================================================
-
-// RagService is exported via class declaration

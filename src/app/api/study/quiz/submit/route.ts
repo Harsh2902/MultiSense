@@ -31,7 +31,7 @@ const submitQuizSchema = z.object({
 export const POST = withApiHandler(async (request: NextRequest): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
-    setRequestUserId(auth.user.id);
+    setRequestUserId(auth.userId);
 
     const body = await request.json();
     const validation = submitQuizSchema.safeParse(body);
@@ -41,7 +41,7 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
     }
 
     const { quiz_id, answers } = validation.data;
-    const quizService = new QuizService(auth.supabase, auth.user.id);
+    const quizService = new QuizService(auth.userId);
     const result = await quizService.submitAttempt(quiz_id, answers);
 
     return NextResponse.json<QuizAttemptResponse>(result, { status: 201 });
