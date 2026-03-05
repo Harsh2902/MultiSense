@@ -62,8 +62,9 @@ const nextConfig = {
     },
 
     // ---------------------------------------------------------------------------
-    // Webpack Configuration
+    // Webpack / Turbopack Configuration
     // ---------------------------------------------------------------------------
+    turbopack: {},
     webpack: (config, { isServer }) => {
         // pdfjs-dist has an optional canvas peer dependency — ignore it
         if (isServer) {
