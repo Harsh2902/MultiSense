@@ -1,6 +1,7 @@
 
 import { LoaderInterface, ProcessingResult } from '../types';
-import pdf from 'pdf-parse';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const pdf = require('pdf-parse');
 import * as fs from 'fs/promises';
 
 export class PDFLoader implements LoaderInterface {
