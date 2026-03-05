@@ -38,7 +38,7 @@ const PUBLIC_ROUTES = ['/', '/about', '/api/health'];
 // Middleware Function
 // =============================================================================
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
     const pathname = request.nextUrl.pathname;
 
     // Create Supabase client for middleware

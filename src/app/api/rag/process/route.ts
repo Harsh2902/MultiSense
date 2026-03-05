@@ -3,6 +3,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { RagPipeline } from '@/lib/rag/pipeline';
 import { createClient } from '@/lib/supabase/server';
 
+export const dynamic = 'force-dynamic';
+
 export async function POST(req: NextRequest) {
     try {
         const { documentId } = await req.json();
