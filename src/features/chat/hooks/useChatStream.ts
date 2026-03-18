@@ -66,7 +66,8 @@ export function useChatStream({ onComplete, onError }: UseChatStreamOptions = {}
     const send = useCallback(async (
         conversationId: string,
         content: string,
-        onUserMessage?: (msg: Partial<MessageRow>) => void
+        onUserMessage?: (msg: Partial<MessageRow>) => void,
+        sourceId?: string
     ) => {
         // --- Double-submit guard ---
         if (sendingRef.current) return;
@@ -100,6 +101,7 @@ export function useChatStream({ onComplete, onError }: UseChatStreamOptions = {}
             const response = await sendMessageStream(
                 conversationId,
                 content,
+                sourceId,
                 controller.signal
             );
 
@@ -137,10 +139,10 @@ export function useChatStream({ onComplete, onError }: UseChatStreamOptions = {}
 
                         switch (event.type) {
                             case 'start':
-                                finalMessageId = event.message_id;
+                                finalMessageId = (event as any).assistant_message_id || event.message_id;
                                 setState(prev => ({
                                     ...prev,
-                                    messageId: event.message_id,
+                                    messageId: (event as any).assistant_message_id || event.message_id,
                                 }));
                                 break;
 

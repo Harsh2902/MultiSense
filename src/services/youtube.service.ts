@@ -188,15 +188,31 @@ export class YouTubeService {
             }
 
             // 4. Extract frames (if enabled)
-            // Use metadata duration as fallback if transcript missing/empty
-            const transcriptDuration = getDurationFromTranscript(transcript);
-            const videoDuration = transcriptDuration > 0
-                ? transcriptDuration
-                : (source.metadata as any)?.durationSeconds || 0;
+            let frames = {
+                frames: [],
+                frameCount: 0,
+                enabled: false,
+            } as Awaited<ReturnType<typeof extractFrames>>;
 
-            const timestamps = calculateFrameTimestamps(videoDuration);
-            const frames = await extractFrames(videoId, timestamps);
-            log(`Frames extracted. Count: ${frames.frames.length}`);
+            if (this.config.enableFrameExtraction) {
+                // Use metadata duration as fallback if transcript missing/empty
+                const transcriptDuration = getDurationFromTranscript(transcript);
+                const videoDuration = transcriptDuration > 0
+                    ? transcriptDuration
+                    : (source.metadata as any)?.durationSeconds || 0;
+
+                const timestamps = calculateFrameTimestamps(videoDuration);
+
+                // Cap frame extraction wait time so jobs don't appear stuck forever.
+                frames = await this.withTimeout(
+                    extractFrames(videoId, timestamps),
+                    90_000,
+                    'Frame extraction timeout after 90 seconds'
+                );
+                log(`Frames extracted. Count: ${frames.frames.length}`);
+            } else {
+                log('Frame extraction disabled. Proceeding with transcript-only flow.');
+            }
 
             // 5. Merge content
             const merged = mergeContent(
@@ -206,26 +222,34 @@ export class YouTubeService {
             );
             log(`Content merged. Word count: ${merged.wordCount}`);
 
-            if (merged.wordCount < 50) {
-                // Determine specific cause
-                let errorMessage = 'Not enough content extracted from video';
-                if (!transcript.available && transcript.error) {
-                    errorMessage = `Content extraction failed: ${transcript.error}`;
-                } else if (frames.error) {
-                    errorMessage += ` (${frames.error})`;
-                }
+            const sourceMeta = source.metadata as Record<string, any> | null;
+            const fallbackContextHeader = [
+                `Video title: ${source.title || sourceMeta?.title || 'Unknown title'}`,
+                `Channel: ${sourceMeta?.channel || 'Unknown channel'}`,
+                `YouTube URL: ${source.source_url || `https://www.youtube.com/watch?v=${videoId}`}`,
+                `Duration (seconds): ${sourceMeta?.durationSeconds || 0}`,
+            ].join('\n');
 
-                await this.markFailed(sourceId, errorMessage);
-                throw new YouTubeError(
-                    errorMessage,
-                    'INSUFFICIENT_CONTENT'
-                );
+            let contentForChunking = merged.fullText.trim();
+            if (!contentForChunking) {
+                contentForChunking = fallbackContextHeader;
+            } else if (merged.wordCount < 50) {
+                contentForChunking = `${fallbackContextHeader}\n\n${contentForChunking}`;
             }
 
             // 6. Normalize and chunk
-            const normalized = normalizeText(merged.fullText);
+            const normalized = normalizeText(contentForChunking);
             const chunked = chunkText(normalized);
             log(`Text chunked. Chunks: ${chunked.chunks.length}`);
+
+            if (!chunked.chunks.length) {
+                const emergencyText = `${fallbackContextHeader}\n\nNo transcript was available. The assistant can still use OCR and video metadata context from this source.`;
+                const emergencyChunked = chunkText(normalizeText(emergencyText));
+                if (!emergencyChunked.chunks.length) {
+                    throw new YouTubeError('Unable to create chunks for YouTube source', 'INSUFFICIENT_CONTENT');
+                }
+                chunked.chunks = emergencyChunked.chunks;
+            }
 
             // 7. Save chunks
             const chunks = await this.saveChunks(
@@ -251,6 +275,9 @@ export class YouTubeService {
             await this.markCompleted(sourceId, {
                 wordCount: merged.wordCount,
                 chunkCount: chunks.length,
+                transcriptAvailable: transcript.available,
+                transcriptError: transcript.error || null,
+                frameExtractionError: frames.error || null,
                 sources: merged.sources,
             });
             log(`Source marked completed.`);
@@ -412,6 +439,29 @@ export class YouTubeService {
                 error_message: error
             }
         });
+    }
+
+    private async withTimeout<T>(
+        promise: Promise<T>,
+        timeoutMs: number,
+        timeoutMessage: string
+    ): Promise<T> {
+        let timeoutHandle: ReturnType<typeof setTimeout>;
+
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(() => {
+                reject(new Error(timeoutMessage));
+            }, timeoutMs);
+        });
+
+        try {
+            const result = await Promise.race([promise, timeoutPromise]);
+            clearTimeout(timeoutHandle!);
+            return result;
+        } catch (error) {
+            clearTimeout(timeoutHandle!);
+            throw error;
+        }
     }
 }
 

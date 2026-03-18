@@ -43,7 +43,7 @@ export const fileMetadataSchema = z.object({
  * Upload request schema
  */
 export const uploadFileSchema = z.object({
-    conversation_id: z.string().uuid('Invalid conversation ID'),
+    conversation_id: z.string().uuid('Invalid conversation ID').optional().nullable(),
 });
 
 /**
@@ -67,6 +67,13 @@ export const listSourcesQuerySchema = z.object({
  */
 export const deleteSourceParamsSchema = z.object({
     sourceId: z.string().uuid('Invalid source ID'),
+});
+
+/**
+ * Link source to conversation request schema
+ */
+export const linkSourceConversationSchema = z.object({
+    conversation_id: z.string().uuid('Invalid conversation ID'),
 });
 
 // =============================================================================

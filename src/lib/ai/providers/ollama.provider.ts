@@ -67,33 +67,52 @@ export class OllamaLLMProvider implements LLMProvider {
     // ===========================================================================
 
     async generate(input: LLMInput): Promise<LLMOutput> {
-        const body = this.buildRequestBody(input, false);
+        let lastError: unknown;
+        const retries = Math.max(0, AI_DEFAULTS.maxRetries);
 
-        const response = await this.fetchWithTimeout(
-            `${this.baseUrl}/v1/chat/completions`,
-            {
-                method: 'POST',
-                headers: this.buildHeaders(),
-                body: JSON.stringify(body),
-                signal: input.signal,
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                const body = this.buildRequestBody(input, false);
+
+                const response = await this.fetchWithTimeout(
+                    `${this.baseUrl}/v1/chat/completions`,
+                    {
+                        method: 'POST',
+                        headers: this.buildHeaders(),
+                        body: JSON.stringify(body),
+                        signal: input.signal,
+                    }
+                );
+
+                await this.handleErrorResponse(response);
+
+                const data = (await response.json()) as OllamaChatResponse;
+                const choice = data.choices?.[0];
+
+                if (!choice) {
+                    throw new ProviderResponseError('ollama', 'No choices in response');
+                }
+
+                return {
+                    content: choice.message.content,
+                    model: data.model,
+                    usage: this.normalizeUsage(data.usage),
+                    finishReason: choice.finish_reason,
+                };
+            } catch (error) {
+                lastError = error;
+                if (!this.shouldRetry(error) || attempt >= retries) {
+                    throw error;
+                }
+
+                const backoffMs = AI_DEFAULTS.retryBaseDelayMs * (attempt + 1);
+                await this.delay(backoffMs);
             }
-        );
-
-        await this.handleErrorResponse(response);
-
-        const data = (await response.json()) as OllamaChatResponse;
-        const choice = data.choices?.[0];
-
-        if (!choice) {
-            throw new ProviderResponseError('ollama', 'No choices in response');
         }
 
-        return {
-            content: choice.message.content,
-            model: data.model,
-            usage: this.normalizeUsage(data.usage),
-            finishReason: choice.finish_reason,
-        };
+        throw (lastError instanceof Error
+            ? lastError
+            : new ProviderUnavailableError('ollama', new Error('Unknown retry failure')));
     }
 
     // ===========================================================================
@@ -267,6 +286,20 @@ export class OllamaLLMProvider implements LLMProvider {
             'ollama',
             { statusCode: status, retryable: false }
         );
+    }
+
+    private shouldRetry(error: unknown): boolean {
+        if (error instanceof AIProviderError) {
+            if (error.code === 'CANCELLED') {
+                return false;
+            }
+            return error.retryable || error.code === 'PROVIDER_UNAVAILABLE';
+        }
+        return false;
+    }
+
+    private delay(ms: number): Promise<void> {
+        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
     private normalizeUsage(raw: {

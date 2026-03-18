@@ -24,13 +24,22 @@ const markFlashcardSchema = z.object({
 
 export const PATCH = withApiHandler(async (
     request: NextRequest,
-    context?: { params?: Record<string, string> }
+    context?: { params?: Promise<{ id: string }> | { id: string } }
 ): Promise<NextResponse> => {
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
     setRequestUserId(auth.userId);
 
-    const id = context?.params?.id;
+    let params: { id: string } | undefined;
+    if (context?.params) {
+        if ('then' in context.params) {
+            params = await context.params;
+        } else {
+            params = context.params;
+        }
+    }
+
+    const id = params?.id;
     if (!id || !/^[0-9a-f-]{36}$/i.test(id)) {
         throw new ValidationError('Invalid flashcard ID');
     }

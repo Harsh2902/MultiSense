@@ -180,16 +180,56 @@ export class TokenTracker {
  * Provider-agnostic utility.
  */
 export function parseLlmJson<T>(raw: string): T {
-    let cleaned = raw.trim();
-    if (cleaned.startsWith('```json')) {
-        cleaned = cleaned.slice(7);
-    } else if (cleaned.startsWith('```')) {
-        cleaned = cleaned.slice(3);
-    }
-    if (cleaned.endsWith('```')) {
-        cleaned = cleaned.slice(0, -3);
-    }
-    cleaned = cleaned.trim();
+    const cleaned = raw.trim();
+    const candidates: string[] = [];
 
-    return JSON.parse(cleaned) as T;
+    // 1) Raw text
+    candidates.push(cleaned);
+
+    // 2) Strip fenced code block (```json ... ```)
+    const fencedMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fencedMatch?.[1]) {
+        candidates.push(fencedMatch[1].trim());
+    }
+
+    // 3) Content between first/last object braces
+    const firstObj = cleaned.indexOf('{');
+    const lastObj = cleaned.lastIndexOf('}');
+    if (firstObj >= 0 && lastObj > firstObj) {
+        candidates.push(cleaned.slice(firstObj, lastObj + 1).trim());
+    }
+
+    // 4) Content between first/last array brackets
+    const firstArr = cleaned.indexOf('[');
+    const lastArr = cleaned.lastIndexOf(']');
+    if (firstArr >= 0 && lastArr > firstArr) {
+        candidates.push(cleaned.slice(firstArr, lastArr + 1).trim());
+    }
+
+    // 5) Markdown fence prefix stripping fallback
+    let fenceStripped = cleaned;
+    if (fenceStripped.startsWith('```json')) {
+        fenceStripped = fenceStripped.slice(7);
+    } else if (fenceStripped.startsWith('```')) {
+        fenceStripped = fenceStripped.slice(3);
+    }
+    if (fenceStripped.endsWith('```')) {
+        fenceStripped = fenceStripped.slice(0, -3);
+    }
+    candidates.push(fenceStripped.trim());
+
+    const seen = new Set<string>();
+    for (const candidate of candidates) {
+        const value = candidate.trim();
+        if (!value || seen.has(value)) continue;
+        seen.add(value);
+        try {
+            return JSON.parse(value) as T;
+        } catch {
+            // Try next candidate
+        }
+    }
+
+    const preview = cleaned.slice(0, 300);
+    throw new Error(`Failed to parse JSON from model output. Preview: ${preview}`);
 }

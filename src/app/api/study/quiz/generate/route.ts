@@ -52,4 +52,4 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
     const result = await quizService.generateQuiz(conversation_id, topic);
 
     return NextResponse.json<QuizResponse>(result, { status: 201 });
-});
+}, { timeoutMs: 180_000 });

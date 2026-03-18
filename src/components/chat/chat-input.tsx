@@ -1,10 +1,23 @@
 'use client';
 
 import * as React from 'react';
-import { SendHorizontal, Paperclip, X } from 'lucide-react';
+import { SendHorizontal, Paperclip, Plus, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuLabel,
+    DropdownMenuSeparator,
+    DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
+
+export interface ChatToolAction {
+    id: string;
+    label: string;
+}
 
 interface ChatInputProps {
     onSend: (message: string) => void;
@@ -12,12 +25,29 @@ interface ChatInputProps {
     onFileSelect?: (file: File) => void;
     selectedFile?: File | null;
     onClearFile?: () => void;
+    uploadingFile?: boolean;
+    enableAttachments?: boolean;
+    toolActions?: ChatToolAction[];
+    onToolSelect?: (toolId: string) => void;
+    toolMenuLabel?: string;
 }
 
-export function ChatInput({ onSend, disabled, onFileSelect, selectedFile, onClearFile }: ChatInputProps) {
+export function ChatInput({
+    onSend,
+    disabled,
+    onFileSelect,
+    selectedFile,
+    onClearFile,
+    uploadingFile,
+    enableAttachments = true,
+    toolActions = [],
+    onToolSelect,
+    toolMenuLabel = 'Study Tools',
+}: ChatInputProps) {
     const [input, setInput] = React.useState('');
     const textareaRef = React.useRef<HTMLTextAreaElement>(null);
     const fileInputRef = React.useRef<HTMLInputElement>(null);
+    const hasToolActions = toolActions.length > 0 && !!onToolSelect;
 
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -56,7 +86,7 @@ export function ChatInput({ onSend, disabled, onFileSelect, selectedFile, onClea
 
     return (
         <div className="relative flex flex-col w-full max-w-3xl mx-auto p-4">
-            {selectedFile && (
+            {enableAttachments && selectedFile && (
                 <div className="absolute -top-12 left-4 flex items-center gap-2 bg-zinc-800 border border-zinc-700 p-2 rounded-lg shadow-lg z-50">
                     <div className="bg-zinc-700/50 p-1 rounded">
                         <Paperclip className="h-4 w-4 text-zinc-300" />
@@ -64,48 +94,85 @@ export function ChatInput({ onSend, disabled, onFileSelect, selectedFile, onClea
                     <span className="text-sm text-zinc-200 max-w-[200px] truncate">
                         {selectedFile.name}
                     </span>
-                    <button
-                        onClick={onClearFile}
-                        className="ml-2 hover:bg-zinc-700 p-1 rounded-full transition-colors"
-                        type="button"
-                    >
-                        <X className="h-3 w-3 text-zinc-400 hover:text-white" />
-                    </button>
+                    {!uploadingFile ? (
+                        <button
+                            onClick={onClearFile}
+                            className="ml-2 hover:bg-zinc-700 p-1 rounded-full transition-colors"
+                            type="button"
+                        >
+                            <X className="h-3 w-3 text-zinc-400 hover:text-white" />
+                        </button>
+                    ) : (
+                        <span className="text-xs text-emerald-400 ml-2 animate-pulse">Processing...</span>
+                    )}
                 </div>
             )}
 
             <div className="relative flex items-end gap-2 p-3 bg-zinc-800/50 rounded-xl border border-zinc-700/50 shadow-lg focus-within:ring-2 focus-within:ring-primary/50 focus-within:border-primary/50 transition-all duration-300 z-50">
-                {/* Hidden File Input */}
-                <input
-                    type="file"
-                    ref={fileInputRef}
-                    className="absolute opacity-0 w-0 h-0"
-                    onChange={handleFileChange}
-                    disabled={disabled}
-                />
+                {hasToolActions && (
+                    <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                            <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 flex-shrink-0 text-zinc-400 hover:text-white rounded-lg mb-1 pointer-events-auto relative z-[120]"
+                                disabled={disabled}
+                                aria-label="Open tools menu"
+                            >
+                                <Plus className="h-5 w-5" />
+                            </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start" className="w-48">
+                            <DropdownMenuLabel>{toolMenuLabel}</DropdownMenuLabel>
+                            <DropdownMenuSeparator />
+                            {toolActions.map((action) => (
+                                <DropdownMenuItem
+                                    key={action.id}
+                                    onClick={() => onToolSelect?.(action.id)}
+                                >
+                                    {action.label}
+                                </DropdownMenuItem>
+                            ))}
+                        </DropdownMenuContent>
+                    </DropdownMenu>
+                )}
 
-                {/* Attachment Button */}
-                <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 flex-shrink-0 text-zinc-400 hover:text-white rounded-lg mb-1 pointer-events-auto relative z-[120]"
-                    onClick={() => {
-                        if (fileInputRef.current) {
-                            fileInputRef.current.click();
-                        }
-                    }}
-                    disabled={disabled}
-                >
-                    <Paperclip className="h-5 w-5" />
-                </Button>
+                {/* Hidden File Input */}
+                {enableAttachments && (
+                    <>
+                        <input
+                            type="file"
+                            ref={fileInputRef}
+                            className="absolute opacity-0 w-0 h-0"
+                            onChange={handleFileChange}
+                            disabled={disabled}
+                        />
+
+                        {/* Attachment Button */}
+                        <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 flex-shrink-0 text-zinc-400 hover:text-white rounded-lg mb-1 pointer-events-auto relative z-[120]"
+                            onClick={() => {
+                                if (fileInputRef.current) {
+                                    fileInputRef.current.click();
+                                }
+                            }}
+                            disabled={disabled}
+                        >
+                            <Paperclip className="h-5 w-5" />
+                        </Button>
+                    </>
+                )}
 
                 <Textarea
                     ref={textareaRef}
                     value={input}
                     onChange={handleInput}
                     onKeyDown={handleKeyDown}
-                    placeholder="Message MultiSense..."
+                    placeholder={uploadingFile ? "Uploading and processing file..." : "Message MultiSense..."}
                     className="min-h-[24px] max-h-[200px] flex-1 w-auto resize-none bg-transparent border-0 focus-visible:ring-0 p-1.5 text-base text-zinc-100 placeholder:text-zinc-500 pointer-events-auto relative z-[120]"
                     disabled={disabled}
                     rows={1}

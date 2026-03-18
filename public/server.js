@@ -1,0 +1,31 @@
+import { ClerkUI } from "./ClerkUI.js";
+import { UI_BRAND } from "./internal/index.js";
+
+//#region src/server.ts
+/**
+* UI object for React Server Components.
+*
+* ClerkUI is imported from a 'use client' module so that RSC serializes it as a
+* client reference. The bundler includes the actual ClerkUI code only in the
+* client bundle and resolves the reference automatically on hydration.
+*
+* @example
+* ```tsx
+* // app/layout.tsx (server component)
+* import { ClerkProvider } from '@clerk/nextjs';
+* import { ui } from '@clerk/ui';
+*
+* export default function Layout({ children }) {
+*   return <ClerkProvider ui={ui}>{children}</ClerkProvider>;
+* }
+* ```
+*/
+const ui = {
+	__brand: UI_BRAND,
+	version: "1.0.1",
+	ClerkUI
+};
+
+//#endregion
+export { ui };
+//# sourceMappingURL=server.js.map

@@ -3,6 +3,7 @@ export {
     fetchSource,
     deleteSource,
     retrySource,
+    linkSourceToConversation,
     uploadFile,
     submitYouTube,
     triggerProcessing,

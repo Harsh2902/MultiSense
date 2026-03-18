@@ -10,11 +10,12 @@ import type { LearningSourceRow } from '@/types/learning';
 // =============================================================================
 
 export async function fetchSources(
-    conversationId: string
+    conversationId: string | null
 ): Promise<{ sources: LearningSourceRow[] }> {
-    return api.get<{ sources: LearningSourceRow[] }>(
-        `/api/learning/sources?conversation_id=${encodeURIComponent(conversationId)}`
-    );
+    const query = conversationId
+        ? `?conversation_id=${encodeURIComponent(conversationId)}`
+        : '';
+    return api.get<{ sources: LearningSourceRow[] }>(`/api/learning/sources${query}`);
 }
 
 export async function fetchSource(
@@ -36,17 +37,29 @@ export async function retrySource(sourceId: string): Promise<{ source: LearningS
     );
 }
 
+export async function linkSourceToConversation(
+    sourceId: string,
+    conversationId: string
+): Promise<{ source: LearningSourceRow }> {
+    return api.patch<{ source: LearningSourceRow }>(
+        `/api/learning/sources/${sourceId}`,
+        { conversation_id: conversationId }
+    );
+}
+
 // =============================================================================
 // File Upload
 // =============================================================================
 
 export async function uploadFile(
-    conversationId: string,
+    conversationId: string | null,
     file: File
 ): Promise<{ source: LearningSourceRow }> {
     const formData = new FormData();
     formData.append('file', file);
-    formData.append('conversation_id', conversationId);
+    if (conversationId) {
+        formData.append('conversation_id', conversationId);
+    }
 
     return api.post<{ source: LearningSourceRow }>(
         '/api/learning/sources',

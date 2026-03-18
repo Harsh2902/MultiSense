@@ -76,12 +76,12 @@ export function collapseWhitespace(text: string): string {
 export function isGarbageText(text: string): boolean {
     if (text.length < 10) return true;
 
-    // Count alphanumeric ratio
-    const alphanumeric = (text.match(/[a-zA-Z0-9]/g) || []).length;
-    const ratio = alphanumeric / text.length;
+    // Count Unicode letters/numbers (works for non-English scripts too)
+    const alphaNumericUnicode = (text.match(/[\p{L}\p{N}]/gu) || []).length;
+    const ratio = alphaNumericUnicode / text.length;
 
-    // Less than 30% alphanumeric is suspicious
-    if (ratio < 0.3) return true;
+    // Less than ~12% letter/number density is suspicious noise
+    if (ratio < 0.12) return true;
 
     // Check for repeated characters
     const repeatedPattern = /(.)\1{5,}/g;

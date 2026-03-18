@@ -136,9 +136,18 @@ export class SummaryService {
             });
 
             // 8. Parse response
-            const parsed = parseLlmJson<GeneratedSummary | { error: string }>(
-                llmResponse.content
-            );
+            let parsed: GeneratedSummary | { error: string };
+            try {
+                parsed = parseLlmJson<GeneratedSummary | { error: string }>(
+                    llmResponse.content
+                );
+            } catch (parseError) {
+                await this.markSummaryFailed(summary.id);
+                throw new StudyToolError(
+                    'The model returned an invalid summary format. Please try again.',
+                    'PARSE_ERROR'
+                );
+            }
 
             if ('error' in parsed && parsed.error === 'insufficient_context') {
                 await this.markSummaryFailed(summary.id);

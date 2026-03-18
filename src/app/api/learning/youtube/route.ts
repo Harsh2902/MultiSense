@@ -3,13 +3,14 @@
 // =============================================================================
 
 import { NextResponse, type NextRequest } from 'next/server';
-import { requireAuth, withApiHandler } from '@/lib/api';
+import { requireAuth, verifyCsrf, withApiHandler } from '@/lib/api';
 import { YouTubeService } from '@/services/youtube.service';
 import { ValidationError, NotFoundError } from '@/lib/errors';
 import { setRequestUserId } from '@/lib/request-context';
 import type { SubmitYouTubeResponse } from '@/types/youtube';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
+import { processPendingSources } from '@/lib/queue';
 
 // =============================================================================
 // Validation Schema
@@ -25,6 +26,9 @@ const submitYouTubeSchema = z.object({
 // =============================================================================
 
 export const POST = withApiHandler(async (request: NextRequest): Promise<NextResponse> => {
+    const csrfError = verifyCsrf(request);
+    if (csrfError) return csrfError;
+
     const auth = await requireAuth();
     if (!auth.success) return auth.error;
     setRequestUserId(auth.userId);
@@ -39,7 +43,7 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
     const { url, conversation_id } = validation.data;
 
     // Verify conversation ownership
-    const conversation = await prisma.conversation.findUnique({
+    const conversation = await prisma.conversation.findFirst({
         where: { id: conversation_id, user_id: auth.userId },
         select: { id: true }
     });
@@ -52,6 +56,11 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
         // Submit video (YouTubeError will be caught by normalizeError)
         const youtubeService = new YouTubeService(auth.userId);
         const { source, metadata } = await youtubeService.submitVideo(url, conversation_id);
+
+        // Fire best-effort processing trigger so the video enters chunking/embedding quickly.
+        void processPendingSources(auth.userId, { batchSize: 1 }).catch((queueError) => {
+            console.error('[YouTube API Error] Failed to trigger processing queue:', queueError);
+        });
 
         return NextResponse.json<SubmitYouTubeResponse>({
             source: {

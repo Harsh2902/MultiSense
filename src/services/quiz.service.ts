@@ -124,13 +124,24 @@ export class QuizService {
             const llmResponse = await this.llm.generate({
                 systemPrompt,
                 userMessage,
+                maxTokens: 1536,
+                temperature: 0.2,
                 jsonMode: true,
             });
 
             // 8. Parse and validate response
-            const parsed = parseLlmJson<GeneratedQuizQuestion[] | { error: string }>(
-                llmResponse.content
-            );
+            let parsed: GeneratedQuizQuestion[] | { error: string };
+            try {
+                parsed = parseLlmJson<GeneratedQuizQuestion[] | { error: string }>(
+                    llmResponse.content
+                );
+            } catch (parseError) {
+                await this.markQuizFailed(quiz.id);
+                throw new StudyToolError(
+                    'The model returned an invalid quiz format. Please try again.',
+                    'PARSE_ERROR'
+                );
+            }
 
             if (!Array.isArray(parsed)) {
                 if ('error' in parsed && parsed.error === 'insufficient_context') {
@@ -254,19 +265,49 @@ export class QuizService {
             .map(a => `${a.question_id}:${a.selected_option_index}`)
             .join('|');
 
-        const answerHash = await this.computeHash(sortedAnswers);
+        let answerHash: string | null = null;
+        try {
+            answerHash = await this.computeHash(sortedAnswers);
 
-        // 5.5 Check duplicate deduplication physically via hash
-        const existingAttempt = await prisma.quizAttempt.findFirst({
-            where: {
-                quiz_id: quizId,
-                answer_hash: answerHash,
-                user_id: this.userId
+            // 5.5 Check duplicate deduplication physically via hash
+            const existingAttempt = await prisma.quizAttempt.findFirst({
+                where: {
+                    quiz_id: quizId,
+                    answer_hash: answerHash,
+                    user_id: this.userId
+                }
+            });
+
+            if (existingAttempt) {
+                throw new StudyToolError('Duplicate submission detected', 'DUPLICATE');
             }
-        });
+        } catch (hashCheckError) {
+            if (!this.isMissingAnswerHashColumnError(hashCheckError)) {
+                throw hashCheckError;
+            }
+            // Backward-compatible fallback for DBs that do not yet have quiz_attempts.answer_hash.
+            answerHash = null;
 
-        if (existingAttempt) {
-            throw new StudyToolError('Duplicate submission detected', 'DUPLICATE');
+            const existingAttempts = await prisma.quizAttempt.findMany({
+                where: {
+                    quiz_id: quizId,
+                    user_id: this.userId
+                },
+                select: {
+                    id: true,
+                    answers: true
+                }
+            });
+
+            const duplicate = existingAttempts.some((attempt) => {
+                const existing = JSON.stringify(attempt.answers ?? []);
+                const current = JSON.stringify(attemptAnswers);
+                return existing === current;
+            });
+
+            if (duplicate) {
+                throw new StudyToolError('Duplicate submission detected', 'DUPLICATE');
+            }
         }
 
         // 6. Store attempt
@@ -277,13 +318,45 @@ export class QuizService {
                     quiz_id: quizId,
                     user_id: this.userId,
                     answers: attemptAnswers as any,
-                    answer_hash: answerHash,
+                    ...(answerHash ? { answer_hash: answerHash } : {}),
                     score: correctCount,
                     percentage,
                 }
             });
         } catch (attemptError: any) {
-            throw new StudyToolError('Failed to submit attempt', 'STORE_FAILED');
+            if (this.isMissingAnswerHashColumnError(attemptError)) {
+                const attemptId = crypto.randomUUID();
+                const insertedRows = await prisma.$queryRaw<Array<{
+                    id: string;
+                    quiz_id: string;
+                    user_id: string;
+                    answers: unknown;
+                    score: number;
+                    percentage: number;
+                    completed_at: Date | string;
+                    created_at: Date | string;
+                }>>`
+                    INSERT INTO quiz_attempts (id, quiz_id, user_id, answers, score, percentage)
+                    VALUES (
+                        ${attemptId},
+                        ${quizId},
+                        ${this.userId},
+                        ${JSON.stringify(attemptAnswers)}::jsonb,
+                        ${correctCount},
+                        ${percentage}
+                    )
+                    RETURNING id, quiz_id, user_id, answers, score, percentage, completed_at, created_at
+                `;
+
+                const inserted = insertedRows[0];
+                if (!inserted) {
+                    throw new StudyToolError('Failed to submit attempt', 'STORE_FAILED');
+                }
+
+                attempt = inserted;
+            } else {
+                throw new StudyToolError('Failed to submit attempt', 'STORE_FAILED');
+            }
         }
 
         // 6. Build response
@@ -296,7 +369,11 @@ export class QuizService {
             };
         });
 
-        const returnedAttempt = { ...attempt, completed_at: attempt.completed_at.toISOString(), created_at: attempt.created_at.toISOString() } as unknown as QuizAttemptRow;
+        const returnedAttempt = {
+            ...attempt,
+            completed_at: this.safeIso(attempt.completed_at),
+            created_at: this.safeIso(attempt.created_at),
+        } as unknown as QuizAttemptRow;
         const returnedQuiz = { ...quiz, status: quiz.status as QuizStatus, created_at: quiz.created_at.toISOString(), updated_at: quiz.updated_at.toISOString() } as unknown as QuizRow;
 
         return { attempt: returnedAttempt, quiz: returnedQuiz, results };
@@ -353,12 +430,20 @@ export class QuizService {
                 conversation_id: conversationId,
                 status: 'generating'
             },
-            select: { id: true }
+            select: { id: true, updated_at: true }
         });
 
         if (concurrent) {
+            const staleMs = Number(process.env.QUIZ_GENERATION_STALE_MS || 5 * 60 * 1000);
+            const ageMs = Date.now() - new Date(concurrent.updated_at).getTime();
+
+            if (ageMs >= staleMs) {
+                await this.markQuizFailed(concurrent.id);
+                return;
+            }
+
             throw new StudyToolError(
-                'A quiz is already being generated for this conversation',
+                'A quiz is already being generated for this conversation. Please wait a moment and try again.',
                 'CONCURRENT_GENERATION'
             );
         }
@@ -381,6 +466,20 @@ export class QuizService {
         const hashBuffer = await crypto.subtle.digest('SHA-256', data);
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    private isMissingAnswerHashColumnError(error: unknown): boolean {
+        if (!error || typeof error !== 'object') return false;
+        const prismaLike = error as { code?: string; message?: string };
+        return prismaLike.code === 'P2022' ||
+            (typeof prismaLike.message === 'string' && prismaLike.message.includes('answer_hash'));
+    }
+
+    private safeIso(value: Date | string | null | undefined): string {
+        if (!value) return new Date().toISOString();
+        const date = value instanceof Date ? value : new Date(value);
+        if (Number.isNaN(date.getTime())) return new Date().toISOString();
+        return date.toISOString();
     }
 }
 

@@ -24,18 +24,71 @@ import type { LearningSourceRow } from '@/types/learning';
 
 export function useSources(conversationId: string | null) {
     const queryClient = useQueryClient();
+    const sourcesQueryKey = queryKeys.learning.sources(conversationId ?? 'all');
+    const allSourcesQueryKey = queryKeys.learning.sources('all');
+    const sidebarSourcesQueryKey = ['sidebar-learning-sources'] as const;
 
     const query = useQuery({
-        queryKey: queryKeys.learning.sources(conversationId ?? ''),
-        queryFn: () => fetchSources(conversationId!),
-        enabled: !!conversationId,
+        queryKey: sourcesQueryKey,
+        queryFn: () => fetchSources(conversationId),
     });
 
     const deleteMutation = useMutation({
         mutationFn: (sourceId: string) => deleteSource(sourceId),
+        onMutate: async (sourceId: string) => {
+            await Promise.all([
+                queryClient.cancelQueries({ queryKey: sourcesQueryKey }),
+                queryClient.cancelQueries({ queryKey: allSourcesQueryKey }),
+                queryClient.cancelQueries({ queryKey: sidebarSourcesQueryKey }),
+            ]);
+
+            const previousScoped = queryClient.getQueryData<{ sources: LearningSourceRow[] }>(sourcesQueryKey);
+            const previousAll = queryClient.getQueryData<{ sources: LearningSourceRow[] }>(allSourcesQueryKey);
+            const previousSidebar = queryClient.getQueryData<LearningSourceRow[]>(sidebarSourcesQueryKey);
+
+            queryClient.setQueryData<{ sources: LearningSourceRow[] } | undefined>(
+                sourcesQueryKey,
+                (old) => old
+                    ? { ...old, sources: old.sources.filter((source) => source.id !== sourceId) }
+                    : old
+            );
+
+            queryClient.setQueryData<{ sources: LearningSourceRow[] } | undefined>(
+                allSourcesQueryKey,
+                (old) => old
+                    ? { ...old, sources: old.sources.filter((source) => source.id !== sourceId) }
+                    : old
+            );
+
+            queryClient.setQueryData<LearningSourceRow[] | undefined>(
+                sidebarSourcesQueryKey,
+                (old) => old
+                    ? old.filter((source) => source.id !== sourceId)
+                    : old
+            );
+
+            return {
+                previousScoped,
+                previousAll,
+                previousSidebar,
+            };
+        },
+        onError: (_error, _sourceId, context) => {
+            if (!context) return;
+
+            queryClient.setQueryData(sourcesQueryKey, context.previousScoped);
+            queryClient.setQueryData(allSourcesQueryKey, context.previousAll);
+            queryClient.setQueryData(sidebarSourcesQueryKey, context.previousSidebar);
+        },
         onSuccess: () => {
             queryClient.invalidateQueries({
-                queryKey: queryKeys.learning.sources(conversationId ?? ''),
+                queryKey: sourcesQueryKey,
+            });
+            queryClient.invalidateQueries({
+                queryKey: allSourcesQueryKey,
+            });
+            queryClient.invalidateQueries({
+                queryKey: sidebarSourcesQueryKey,
             });
         },
     });
@@ -44,7 +97,7 @@ export function useSources(conversationId: string | null) {
         mutationFn: (sourceId: string) => retrySource(sourceId),
         onSuccess: () => {
             queryClient.invalidateQueries({
-                queryKey: queryKeys.learning.sources(conversationId ?? ''),
+                queryKey: sourcesQueryKey,
             });
         },
     });
@@ -65,11 +118,12 @@ export function useSources(conversationId: string | null) {
 
 export function useFileUpload(conversationId: string | null) {
     const queryClient = useQueryClient();
+    const sourcesQueryKey = queryKeys.learning.sources(conversationId ?? 'all');
     const [isUploading, setIsUploading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
     const upload = useCallback(async (file: File) => {
-        if (!conversationId || isUploading) return null;
+        if (isUploading) return null;
 
         setIsUploading(true);
         setError(null);
@@ -77,7 +131,7 @@ export function useFileUpload(conversationId: string | null) {
         try {
             const result = await uploadFile(conversationId, file);
             queryClient.invalidateQueries({
-                queryKey: queryKeys.learning.sources(conversationId),
+                queryKey: sourcesQueryKey,
             });
             return result.source;
         } catch (err) {
@@ -87,7 +141,7 @@ export function useFileUpload(conversationId: string | null) {
         } finally {
             setIsUploading(false);
         }
-    }, [conversationId, isUploading, queryClient]);
+    }, [conversationId, isUploading, queryClient, sourcesQueryKey]);
 
     return { upload, isUploading, error, clearError: () => setError(null) };
 }
@@ -98,12 +152,18 @@ export function useFileUpload(conversationId: string | null) {
 
 export function useYouTubeSubmit(conversationId: string | null) {
     const queryClient = useQueryClient();
+    const sourcesQueryKey = queryKeys.learning.sources(conversationId ?? 'all');
 
     const mutation = useMutation({
-        mutationFn: (url: string) => submitYouTube(conversationId!, url),
+        mutationFn: async (url: string) => {
+            if (!conversationId) {
+                throw new Error('Please select a library before adding YouTube videos');
+            }
+            return submitYouTube(conversationId, url);
+        },
         onSuccess: () => {
             queryClient.invalidateQueries({
-                queryKey: queryKeys.learning.sources(conversationId ?? ''),
+                queryKey: sourcesQueryKey,
             });
         },
     });

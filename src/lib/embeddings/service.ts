@@ -75,13 +75,13 @@ export class EmbeddingService {
             );
 
             // Store embeddings
-            await this.storeEmbeddings(chunks, embeddings);
-
-            result.success.push(...chunks.map(c => c.id));
-            result.count += chunks.length;
+            const stored = await this.storeEmbeddings(chunks, embeddings);
+            result.success.push(...stored.successIds);
+            result.failed.push(...stored.failedIds);
+            result.count += stored.successIds.length;
         } catch (batchError) {
             // Batch failed, try individual chunks
-            console.warn('[Embedding] Batch failed, trying individual chunks');
+            console.warn('[Embedding] Batch failed, trying individual chunks:', batchError);
 
             for (let i = 0; i < chunks.length; i++) {
                 const chunk = chunks[i];
@@ -96,7 +96,8 @@ export class EmbeddingService {
                     await this.storeEmbedding(chunk.id, embedding);
                     result.success.push(chunk.id);
                     result.count++;
-                } catch {
+                } catch (singleError) {
+                    console.error(`[Embedding] Failed to embed individual chunk ${chunk.id}:`, singleError);
                     result.failed.push(chunk.id);
                 }
             }
@@ -114,20 +115,35 @@ export class EmbeddingService {
     private async storeEmbeddings(
         chunks: Array<{ id: string }>,
         embeddings: number[][]
-    ): Promise<void> {
-        // Perform multiple raw updates sequentially or within a transaction
-        // as standard Prisma functions don't support pgvector inserting
+    ): Promise<{ successIds: string[]; failedIds: string[] }> {
+        console.log(`[EmbeddingService] Storing ${chunks.length} embeddings individually to avoid transaction limits`);
+        const successIds: string[] = [];
+        const failedIds: string[] = [];
 
-        await prisma.$transaction(
-            chunks.map((chunk, i) => {
-                const vectorString = `[${(embeddings[i] || []).join(',')}]`;
-                return prisma.$executeRawUnsafe(
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const embedding = embeddings[i];
+            if (!chunk || !embedding) {
+                if (chunk?.id) failedIds.push(chunk.id);
+                continue;
+            }
+
+            try {
+                const vectorString = `[${embedding.join(',')}]`;
+                await prisma.$executeRawUnsafe(
                     `UPDATE "source_chunks" SET embedding = $1::vector WHERE id = $2`,
                     vectorString,
                     chunk.id
                 );
-            })
-        );
+                successIds.push(chunk.id);
+            } catch (err) {
+                console.error(`[EmbeddingService] Failed to store embedding for chunk ${chunk.id}:`, err);
+                failedIds.push(chunk.id);
+            }
+        }
+
+        console.log(`[EmbeddingService] Storage complete: ${successIds.length} success, ${failedIds.length} failed`);
+        return { successIds, failedIds };
     }
 
     /**

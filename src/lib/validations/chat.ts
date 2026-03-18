@@ -102,6 +102,7 @@ export const messageRoleSchema = z.enum(['user', 'assistant', 'system']);
  */
 export const sendMessageSchema = z.object({
     conversation_id: uuidSchema,
+    source_id: uuidSchema.optional(),
     content: z
         .string()
         .min(1, 'Message cannot be empty')

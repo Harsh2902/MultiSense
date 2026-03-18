@@ -52,62 +52,140 @@ export class RagService {
     ): Promise<RagContext> {
         const cfg = { ...DEFAULT_RETRIEVAL_CONFIG, ...config };
 
-        // 1. Generate query embedding
-        const queryEmbedding = await this.embeddingService.embedQuery(query);
+        let matches: any[] = [];
+        let usedVector = false;
 
-        // 2. Search for matching chunks via Raw SQL pgvector
-        const vectorString = `[${queryEmbedding.join(',')}]`;
-        const matches = await prisma.$queryRaw<any[]>`
-            SELECT
-                c.id,
-                c.source_id,
-                c.content,
-                c.chunk_index,
-                1 - (c.embedding <=> ${vectorString}::vector) as similarity,
-                s.title as source_title,
-                s.original_filename as source_file_name,
-                s.source_type
-            FROM source_chunks c
-            JOIN learning_sources s ON c.source_id = s.id
-            WHERE s.conversation_id = ${conversationId}
-              AND 1 - (c.embedding <=> ${vectorString}::vector) > ${cfg.threshold}
-            ORDER BY c.embedding <=> ${vectorString}::vector
-            LIMIT ${cfg.k}
-        `;
+        // 1. Try vector retrieval first
+        try {
+            const queryEmbedding = await this.embeddingService.embedQuery(query);
+            const vectorString = `[${queryEmbedding.join(',')}]`;
+            usedVector = true;
 
-        if (!matches) {
-            throw new Error(`Failed to retrieve chunks`);
+            // 2. Search by similarity threshold
+            matches = await prisma.$queryRaw<any[]>`
+                SELECT
+                    c.id,
+                    c.source_id,
+                    c.content,
+                    c.chunk_index,
+                    1 - (c.embedding <=> ${vectorString}::vector) as similarity,
+                    s.title as source_title,
+                    s.original_filename as source_file_name,
+                    s.source_type
+                FROM source_chunks c
+                JOIN learning_sources s ON c.source_id = s.id
+                WHERE s.conversation_id = ${conversationId}
+                  AND s.user_id = ${this.userId}
+                  AND c.embedding IS NOT NULL
+                  AND 1 - (c.embedding <=> ${vectorString}::vector) > ${cfg.threshold}
+                ORDER BY c.embedding <=> ${vectorString}::vector
+                LIMIT ${cfg.k}
+            `;
+
+            // 3. Fallback: best-k by vector distance without strict threshold
+            if (matches.length === 0) {
+                matches = await prisma.$queryRaw<any[]>`
+                    SELECT
+                        c.id,
+                        c.source_id,
+                        c.content,
+                        c.chunk_index,
+                        1 - (c.embedding <=> ${vectorString}::vector) as similarity,
+                        s.title as source_title,
+                        s.original_filename as source_file_name,
+                        s.source_type
+                    FROM source_chunks c
+                    JOIN learning_sources s ON c.source_id = s.id
+                    WHERE s.conversation_id = ${conversationId}
+                      AND s.user_id = ${this.userId}
+                      AND c.embedding IS NOT NULL
+                    ORDER BY c.embedding <=> ${vectorString}::vector
+                    LIMIT ${cfg.k}
+                `;
+            }
+        } catch (embeddingError) {
+            // Keep chat/study tools usable even if vector retrieval is unavailable.
+            console.warn('[RAG] Conversation vector retrieval unavailable, falling back to lexical/source chunks:', embeddingError);
         }
 
-        // 3. Convert to RetrievedChunk format
-        const rawChunks: RetrievedChunk[] = matches.map((m: any) => ({
-            id: m.id,
-            sourceId: m.source_id,
-            content: m.content,
-            chunkIndex: m.chunk_index,
-            similarity: m.similarity,
-            sourceMetadata: {
-                title: m.source_title,
-                fileName: m.source_file_name,
-                sourceType: m.source_type,
-            },
-        }));
+        // 4. Lexical fallback
+        if (matches.length === 0) {
+            matches = await prisma.$queryRaw<any[]>`
+                SELECT
+                    c.id,
+                    c.source_id,
+                    c.content,
+                    c.chunk_index,
+                    ts_rank_cd(
+                        to_tsvector('simple', c.content),
+                        plainto_tsquery('simple', ${query})
+                    ) as similarity,
+                    s.title as source_title,
+                    s.original_filename as source_file_name,
+                    s.source_type
+                FROM source_chunks c
+                JOIN learning_sources s ON c.source_id = s.id
+                WHERE s.conversation_id = ${conversationId}
+                  AND s.user_id = ${this.userId}
+                  AND to_tsvector('simple', c.content) @@ plainto_tsquery('simple', ${query})
+                ORDER BY similarity DESC, s.created_at ASC, c.chunk_index ASC
+                LIMIT ${cfg.k}
+            `;
+        }
+
+        // 5. Final fallback: provide initial chunks from the conversation
+        if (matches.length === 0) {
+            matches = await prisma.$queryRaw<any[]>`
+                SELECT
+                    c.id,
+                    c.source_id,
+                    c.content,
+                    c.chunk_index,
+                    0.01 as similarity,
+                    s.title as source_title,
+                    s.original_filename as source_file_name,
+                    s.source_type
+                FROM source_chunks c
+                JOIN learning_sources s ON c.source_id = s.id
+                WHERE s.conversation_id = ${conversationId}
+                  AND s.user_id = ${this.userId}
+                ORDER BY s.created_at ASC, c.chunk_index ASC
+                LIMIT ${Math.max(1, Math.min(cfg.k, 5))}
+            `;
+        }
+
+        if (matches.length === 0) {
+            return {
+                chunks: [],
+                formattedContext: '',
+                tokenCount: 0,
+                truncated: false,
+                rawChunkCount: 0,
+            };
+        }
+
+        if (!usedVector) {
+            console.log(`[RAG] Conversation ${conversationId}: using non-vector fallback retrieval (${matches.length} chunks)`);
+        }
+
+        // 6. Convert to RetrievedChunk format
+        const rawChunks: RetrievedChunk[] = this.toRetrievedChunks(matches);
 
         const rawChunkCount = rawChunks.length;
 
-        // 4. Sort by source order (group by source, then by chunk index)
+        // 7. Sort by source order (group by source, then by chunk index)
         const sorted = this.sortBySourceOrder(rawChunks);
 
-        // 5. Deduplicate overlapping chunks
+        // 8. Deduplicate overlapping chunks
         const deduped = this.deduplicateOverlaps(sorted);
 
-        // 6. Apply token limit
+        // 9. Apply token limit
         const { chunks, truncated, tokenCount } = this.applyTokenLimit(
             deduped,
             cfg.maxContextTokens
         );
 
-        // 7. Format context for LLM
+        // 10. Format context for LLM
         const formattedContext = this.formatContext(chunks);
 
         return {
@@ -117,6 +195,166 @@ export class RagService {
             truncated,
             rawChunkCount,
         };
+    }
+
+    /**
+     * Retrieve context constrained to a single learning source.
+     */
+    async retrieveContextBySource(
+        sourceId: string,
+        query: string,
+        config: Partial<RetrievalConfig> = {}
+    ): Promise<RagContext> {
+        const cfg = { ...DEFAULT_RETRIEVAL_CONFIG, ...config };
+        let matches: any[] = [];
+        let usedVector = false;
+
+        try {
+            const queryEmbedding = await this.embeddingService.embedQuery(query);
+            const vectorString = `[${queryEmbedding.join(',')}]`;
+            usedVector = true;
+
+            // 1) Strict vector threshold
+            matches = await prisma.$queryRaw<any[]>`
+                SELECT
+                    c.id,
+                    c.source_id,
+                    c.content,
+                    c.chunk_index,
+                    1 - (c.embedding <=> ${vectorString}::vector) as similarity,
+                    s.title as source_title,
+                    s.original_filename as source_file_name,
+                    s.source_type
+                FROM source_chunks c
+                JOIN learning_sources s ON c.source_id = s.id
+                WHERE s.id = ${sourceId}
+                  AND s.user_id = ${this.userId}
+                  AND c.embedding IS NOT NULL
+                  AND 1 - (c.embedding <=> ${vectorString}::vector) > ${cfg.threshold}
+                ORDER BY c.embedding <=> ${vectorString}::vector
+                LIMIT ${cfg.k}
+            `;
+
+            // 2) Vector nearest-k fallback (no threshold)
+            if (matches.length === 0) {
+                matches = await prisma.$queryRaw<any[]>`
+                    SELECT
+                        c.id,
+                        c.source_id,
+                        c.content,
+                        c.chunk_index,
+                        1 - (c.embedding <=> ${vectorString}::vector) as similarity,
+                        s.title as source_title,
+                        s.original_filename as source_file_name,
+                        s.source_type
+                    FROM source_chunks c
+                    JOIN learning_sources s ON c.source_id = s.id
+                    WHERE s.id = ${sourceId}
+                      AND s.user_id = ${this.userId}
+                      AND c.embedding IS NOT NULL
+                    ORDER BY c.embedding <=> ${vectorString}::vector
+                    LIMIT ${cfg.k}
+                `;
+            }
+        } catch (embeddingError) {
+            // Continue with non-vector fallback so source chat remains usable.
+            console.warn('[RAG] Source vector retrieval unavailable, falling back to lexical/source chunks:', embeddingError);
+        }
+
+        // 3) Lexical fallback for sources with missing embeddings or low similarity
+        if (matches.length === 0) {
+            matches = await prisma.$queryRaw<any[]>`
+                SELECT
+                    c.id,
+                    c.source_id,
+                    c.content,
+                    c.chunk_index,
+                    ts_rank_cd(
+                        to_tsvector('simple', c.content),
+                        plainto_tsquery('simple', ${query})
+                    ) as similarity,
+                    s.title as source_title,
+                    s.original_filename as source_file_name,
+                    s.source_type
+                FROM source_chunks c
+                JOIN learning_sources s ON c.source_id = s.id
+                WHERE s.id = ${sourceId}
+                  AND s.user_id = ${this.userId}
+                  AND to_tsvector('simple', c.content) @@ plainto_tsquery('simple', ${query})
+                ORDER BY similarity DESC, c.chunk_index ASC
+                LIMIT ${cfg.k}
+            `;
+        }
+
+        // 4) Final fallback: provide initial chunks from the source
+        if (matches.length === 0) {
+            matches = await prisma.$queryRaw<any[]>`
+                SELECT
+                    c.id,
+                    c.source_id,
+                    c.content,
+                    c.chunk_index,
+                    0.01 as similarity,
+                    s.title as source_title,
+                    s.original_filename as source_file_name,
+                    s.source_type
+                FROM source_chunks c
+                JOIN learning_sources s ON c.source_id = s.id
+                WHERE s.id = ${sourceId}
+                  AND s.user_id = ${this.userId}
+                ORDER BY c.chunk_index ASC
+                LIMIT ${Math.max(1, Math.min(cfg.k, 3))}
+            `;
+        }
+
+        if (matches.length === 0) {
+            // No chunks were ever created for this source.
+            return {
+                chunks: [],
+                formattedContext: '',
+                tokenCount: 0,
+                truncated: false,
+                rawChunkCount: 0,
+            };
+        }
+
+        if (!usedVector) {
+            console.log(`[RAG] Source ${sourceId}: using non-vector fallback retrieval (${matches.length} chunks)`);
+        }
+
+        const rawChunks: RetrievedChunk[] = this.toRetrievedChunks(matches);
+
+        const rawChunkCount = rawChunks.length;
+        const sorted = this.sortBySourceOrder(rawChunks);
+        const deduped = this.deduplicateOverlaps(sorted);
+        const { chunks, truncated, tokenCount } = this.applyTokenLimit(
+            deduped,
+            cfg.maxContextTokens
+        );
+        const formattedContext = this.formatContext(chunks);
+
+        return {
+            chunks,
+            formattedContext,
+            tokenCount,
+            truncated,
+            rawChunkCount,
+        };
+    }
+
+    private toRetrievedChunks(matches: any[]): RetrievedChunk[] {
+        return matches.map((m: any) => ({
+            id: m.id,
+            sourceId: m.source_id,
+            content: m.content,
+            chunkIndex: m.chunk_index,
+            similarity: Number(m.similarity ?? 0),
+            sourceMetadata: {
+                title: m.source_title,
+                fileName: m.source_file_name,
+                sourceType: m.source_type,
+            },
+        }));
     }
 
     // ===========================================================================
@@ -286,4 +524,3 @@ export class RagService {
             .join('\n\n---\n\n');
     }
 }
-

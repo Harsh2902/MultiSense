@@ -132,6 +132,7 @@ export interface UpdateConversationRequest {
  */
 export interface SendMessageRequest {
     conversation_id: string;
+    source_id?: string;
     content: string;
 }
 

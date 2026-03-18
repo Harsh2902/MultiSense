@@ -3,6 +3,14 @@
 // =============================================================================
 
 import type { TranscriptResult, TranscriptSegment } from '@/types/youtube';
+import { YtDlp } from './ytdlp';
+import os from 'os';
+import path from 'path';
+import fs from 'fs/promises';
+import { promisify } from 'util';
+import { execFile } from 'child_process';
+
+const execFileAsync = promisify(execFile);
 
 // =============================================================================
 // Transcript Fetching
@@ -54,12 +62,41 @@ export async function extractTranscript(videoId: string): Promise<TranscriptResu
         // Dynamic import to handle missing package gracefully
         const { YoutubeTranscript } = await import('youtube-transcript');
 
-        // Fetch transcript (prefers English, falls back to auto-generated)
-        const rawTranscript = await YoutubeTranscript.fetchTranscript(videoId, {
-            lang: 'en',
-        });
+        // Fetch transcript with language fallbacks (English -> Hindi -> default available).
+        let rawTranscript: RawTranscriptSegment[] = [];
+        let transcriptLanguage = 'en';
+        const languageAttempts: Array<'en' | 'hi'> = ['en', 'hi'];
+        let lastPrimaryError: unknown;
 
-        if (!rawTranscript || rawTranscript.length === 0) {
+        for (const lang of languageAttempts) {
+            try {
+                const result = await YoutubeTranscript.fetchTranscript(videoId, { lang });
+                if (result && result.length > 0) {
+                    rawTranscript = result as RawTranscriptSegment[];
+                    transcriptLanguage = lang;
+                    break;
+                }
+            } catch (error) {
+                lastPrimaryError = error;
+            }
+        }
+
+        if (!rawTranscript.length) {
+            try {
+                const result = await YoutubeTranscript.fetchTranscript(videoId);
+                if (result && result.length > 0) {
+                    rawTranscript = result as RawTranscriptSegment[];
+                    transcriptLanguage = 'auto';
+                }
+            } catch (error) {
+                lastPrimaryError = error;
+            }
+        }
+
+        if (!rawTranscript.length) {
+            if (lastPrimaryError) {
+                console.error('[Transcript] Primary extraction error:', lastPrimaryError);
+            }
             console.log('[Transcript] Primary extraction returned empty, triggering fallback...');
             return await fallbackToOthers(videoId);
         }
@@ -85,7 +122,7 @@ export async function extractTranscript(videoId: string): Promise<TranscriptResu
             segments: normalizedSegments,
             fullText,
             wordCount: countWords(fullText),
-            language: 'en',
+            language: transcriptLanguage,
             available: true,
         };
     } catch (error) {
@@ -96,6 +133,8 @@ export async function extractTranscript(videoId: string): Promise<TranscriptResu
 }
 
 async function fallbackToOthers(videoId: string): Promise<TranscriptResult> {
+    const fallbackErrors: string[] = [];
+
     // Try YouTubei.js (Innertube) as fallback before AI
     try {
         const { getInnertube } = await import('./client');
@@ -124,12 +163,41 @@ async function fallbackToOthers(videoId: string): Promise<TranscriptResult> {
         }
     } catch (innertubeError) {
         console.error('Innertube Transcript Fallback failed:', innertubeError);
+        fallbackErrors.push(`innertube: ${String((innertubeError as any)?.message || innertubeError)}`);
+    }
+
+    // Try extracting subtitle tracks via yt-dlp (manual or auto-generated).
+    try {
+        const subtitleResult = await extractTranscriptFromYtDlpSubtitles(videoId);
+        if (subtitleResult.available && subtitleResult.wordCount > 20) {
+            return subtitleResult;
+        }
+        if (subtitleResult.error) {
+            fallbackErrors.push(`yt-dlp subtitles: ${subtitleResult.error}`);
+        }
+    } catch (subtitleError) {
+        console.error('yt-dlp subtitle fallback failed:', subtitleError);
+        fallbackErrors.push(`yt-dlp subtitles: ${String((subtitleError as any)?.message || subtitleError)}`);
+    }
+
+    // Try local multilingual ASR fallback (faster-whisper).
+    try {
+        const localAsrResult = await extractTranscriptWithLocalWhisper(videoId);
+        if (localAsrResult.available && localAsrResult.wordCount > 20) {
+            return localAsrResult;
+        }
+        if (localAsrResult.error) {
+            fallbackErrors.push(`local whisper: ${localAsrResult.error}`);
+        }
+    } catch (localAsrError) {
+        console.error('Local Whisper fallback failed:', localAsrError);
+        fallbackErrors.push(`local whisper: ${String((localAsrError as any)?.message || localAsrError)}`);
     }
 
 
     // Try AI Transcription if enabled
     // Only if explicitly configured with keys, otherwise skip to avoid errors
-    if (process.env.GROQ_API_KEY || (process.env.GOOGLE_GENERATIVE_AI_API_KEY && process.env.AI_PROVIDER !== 'ollama')) {
+    if (process.env.GROQ_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
         console.log('[Transcript] Attempting AI fallback...');
         try {
             const fsLog = await import('fs');
@@ -140,11 +208,6 @@ async function fallbackToOthers(videoId: string): Promise<TranscriptResult> {
 
         try {
             const { generateAiTranscript } = await import('./ai-transcript');
-            // Check if we are forced to use Ollama, if so, we can't really use generateAiTranscript which relies on Gemini/Groq
-            if (process.env.AI_PROVIDER === 'ollama') {
-                throw new Error('AI Provider is Ollama, skipping external AI transcription fallback.');
-            }
-
             const aiResult = await generateAiTranscript(videoId);
 
             if (aiResult.available && aiResult.wordCount > 50) {
@@ -158,6 +221,7 @@ async function fallbackToOthers(videoId: string): Promise<TranscriptResult> {
             }
         } catch (aiError: any) {
             console.error('AI Fallback failed:', aiError);
+            fallbackErrors.push(`ai fallback: ${aiError.message}`);
             try {
                 const fsLog = await import('fs');
                 const pathLog = await import('path');
@@ -167,15 +231,192 @@ async function fallbackToOthers(videoId: string): Promise<TranscriptResult> {
             // Continue to return error for standard method
         }
     } else {
+        fallbackErrors.push('external AI keys missing');
         try {
             const fsLog = await import('fs');
             const pathLog = await import('path');
             const logFile = pathLog.join(process.cwd(), 'youtube-debug.log');
-            fsLog.appendFileSync(logFile, `[Transcript] ${new Date().toISOString()}: External keys missing or Ollama enabled, skipping AI fallback\n`);
+            fsLog.appendFileSync(logFile, `[Transcript] ${new Date().toISOString()}: External AI keys missing, skipping AI fallback\n`);
         } catch { }
     }
 
-    return createEmptyResult('Failed to extract transcript after all attempts');
+    const detail = fallbackErrors.filter(Boolean).join(' | ');
+    return createEmptyResult(
+        detail
+            ? `Failed to extract transcript after all attempts: ${detail}`
+            : 'Failed to extract transcript after all attempts'
+    );
+}
+
+async function extractTranscriptFromYtDlpSubtitles(videoId: string): Promise<TranscriptResult> {
+    const tempDir = path.join(os.tmpdir(), `yt-subs-${videoId}-${Date.now()}`);
+    try {
+        const subtitlePath = await YtDlp.getInstance().downloadSubtitles(videoId, tempDir);
+        if (!subtitlePath) {
+            return createEmptyResult('No subtitle tracks available from yt-dlp');
+        }
+
+        const vttRaw = await fs.readFile(subtitlePath, 'utf-8');
+        const segments = parseVttToSegments(vttRaw);
+        const normalizedSegments = normalizeSegments(segments);
+        const fullText = normalizedSegments.map((s) => s.text).join(' ').trim();
+        const words = countWords(fullText);
+
+        if (!fullText || words < 5) {
+            return createEmptyResult('Subtitle track was empty after parsing');
+        }
+
+        return {
+            segments: normalizedSegments,
+            fullText,
+            wordCount: words,
+            language: 'en',
+            available: true,
+            isAiGenerated: false,
+        };
+    } finally {
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
+    }
+}
+
+function parseVttToSegments(vtt: string): TranscriptSegment[] {
+    const lines = vtt.replace(/\r/g, '').split('\n');
+    const segments: TranscriptSegment[] = [];
+    let i = 0;
+
+    while (i < lines.length) {
+        const line = (lines[i] || '').trim();
+        if (!line || line === 'WEBVTT' || line.startsWith('NOTE')) {
+            i++;
+            continue;
+        }
+
+        // Optional cue index line (numeric).
+        if (/^\d+$/.test(line)) {
+            i++;
+        }
+
+        const timingLine = (lines[i] || '').trim();
+        const match = timingLine.match(
+            /^(\d{2}:)?\d{2}:\d{2}\.\d{3}\s+-->\s+(\d{2}:)?\d{2}:\d{2}\.\d{3}/
+        );
+        if (!match) {
+            i++;
+            continue;
+        }
+
+        const [startRawRaw, endRawRaw] = timingLine.split('-->').map((s) => s.trim().split(' ')[0] || '');
+        const startRaw = startRawRaw || '';
+        const endRaw = endRawRaw || '';
+        i++;
+
+        const textLines: string[] = [];
+        while (i < lines.length && (lines[i] || '').trim() !== '') {
+            textLines.push((lines[i] || '').trim());
+            i++;
+        }
+
+        const text = cleanTranscriptText(
+            textLines
+                .join(' ')
+                .replace(/<[^>]+>/g, ' ') // remove VTT formatting tags
+                .replace(/\s+/g, ' ')
+                .trim()
+        );
+
+        if (text) {
+            const startSeconds = vttTimeToSeconds(startRaw);
+            const endSeconds = vttTimeToSeconds(endRaw);
+            segments.push({
+                text,
+                startSeconds,
+                durationSeconds: Math.max(0, endSeconds - startSeconds),
+                isAutoGenerated: true,
+            });
+        }
+
+        i++;
+    }
+
+    return segments;
+}
+
+async function extractTranscriptWithLocalWhisper(videoId: string): Promise<TranscriptResult> {
+    const tempDir = path.join(os.tmpdir(), `yt-audio-${videoId}-${Date.now()}`);
+    const audioPath = path.join(tempDir, `${videoId}.mp3`);
+
+    try {
+        await fs.mkdir(tempDir, { recursive: true });
+        await YtDlp.getInstance().downloadAudio(videoId, audioPath);
+
+        const pythonBin = process.env.PYTHON_BIN || 'python';
+        const scriptPath = path.join(process.cwd(), 'scripts', 'transcribe_audio.py');
+        const modelName = process.env.LOCAL_WHISPER_MODEL || 'tiny';
+        const timeoutMs = Number(process.env.LOCAL_WHISPER_TIMEOUT_MS || 15 * 60 * 1000);
+
+        const { stdout } = await execFileAsync(
+            pythonBin,
+            [scriptPath, '--input', audioPath, '--model', modelName],
+            {
+                timeout: timeoutMs,
+                maxBuffer: 20 * 1024 * 1024,
+            }
+        );
+
+        const parsed = JSON.parse(stdout || '{}') as {
+            language?: string;
+            segments?: Array<{ start: number; end: number; text: string }>;
+        };
+
+        const rawSegments = Array.isArray(parsed.segments) ? parsed.segments : [];
+        const segments = rawSegments
+            .filter((seg) => typeof seg?.text === 'string' && seg.text.trim().length > 0)
+            .map((seg) => ({
+                text: cleanTranscriptText(seg.text),
+                startSeconds: Number(seg.start || 0),
+                durationSeconds: Math.max(0, Number(seg.end || 0) - Number(seg.start || 0)),
+                isAutoGenerated: true,
+            }));
+
+        const normalizedSegments = normalizeSegments(segments);
+        const fullText = normalizedSegments.map((s) => s.text).join(' ').trim();
+        const words = countWords(fullText);
+
+        if (!fullText || words < 5) {
+            return createEmptyResult('Local Whisper produced insufficient transcript text');
+        }
+
+        return {
+            segments: normalizedSegments,
+            fullText,
+            wordCount: words,
+            language: parsed.language || 'unknown',
+            available: true,
+            isAiGenerated: true,
+        };
+    } catch (error: any) {
+        return createEmptyResult(
+            `Local Whisper transcription failed: ${error?.message || 'Unknown local ASR error'}`
+        );
+    } finally {
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => { });
+    }
+}
+
+function vttTimeToSeconds(value: string): number {
+    const parts = value.split(':');
+    if (parts.length === 2) {
+        const mins = Number(parts[0] || 0);
+        const secs = Number(parts[1] || 0);
+        return mins * 60 + secs;
+    }
+    if (parts.length === 3) {
+        const hours = Number(parts[0] || 0);
+        const mins = Number(parts[1] || 0);
+        const secs = Number(parts[2] || 0);
+        return hours * 3600 + mins * 60 + secs;
+    }
+    return 0;
 }
 
 // =============================================================================

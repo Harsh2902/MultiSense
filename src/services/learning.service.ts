@@ -5,6 +5,7 @@
 import { prisma } from '@/lib/prisma';
 import type { Prisma } from '@prisma/client';
 import { storage } from '@/lib/storage';
+import { NotFoundError } from '@/lib/errors';
 import type {
     LearningSourceRow,
     LearningSourceMetadata,
@@ -26,7 +27,7 @@ import {
 } from '@/lib/files';
 
 export interface CreateSourceOptions {
-    conversation_id: string;
+    conversation_id: string | null;
     original_filename: string;
     file_type: FileType;
     file_size: number;
@@ -38,6 +39,18 @@ export interface ProcessingResult {
     success: boolean;
     chunks_created: number;
     error?: string;
+}
+
+export interface ProcessSourceOptions {
+    /**
+     * Skip atomic claim step when caller already claimed this source.
+     * Used by DB-backed queue processor to avoid double-claim races.
+     */
+    skipClaim?: boolean;
+    /**
+     * Optional pre-fetched source row when status is already `processing`.
+     */
+    preclaimedSource?: LearningSourceRow;
 }
 
 export class LearningService {
@@ -74,8 +87,31 @@ export class LearningService {
         return { ...data, created_at: data.created_at.toISOString(), updated_at: data.updated_at.toISOString(), conversation_id: data.conversation_id || null } as unknown as LearningSourceRow;
     }
 
+    async linkSourceToConversation(sourceId: string, conversationId: string): Promise<LearningSourceRow> {
+        const source = await this.getSource(sourceId);
+        if (!source) {
+            throw new NotFoundError('Source', sourceId);
+        }
+
+        const updatedRow = await prisma.learningSource.update({
+            where: { id: sourceId },
+            data: {
+                conversation_id: conversationId,
+                metadata: {
+                    ...(source.metadata as Record<string, unknown> ?? {}),
+                    chat_scope: 'source',
+                    chat_scope_source_id: sourceId,
+                } as Prisma.JsonObject,
+            },
+        });
+
+        const updated = { ...updatedRow, created_at: updatedRow.created_at.toISOString(), updated_at: updatedRow.updated_at.toISOString(), conversation_id: updatedRow.conversation_id || null } as unknown as LearningSourceRow;
+
+        return updated;
+    }
+
     async listSources(
-        conversationId?: string,
+        conversationId?: string | null,
         options?: { status?: ProcessingStatus; limit?: number }
     ): Promise<LearningSourceRow[]> {
         const limit = options?.limit ?? 50;
@@ -126,27 +162,34 @@ export class LearningService {
     async deleteSource(sourceId: string): Promise<void> {
         const source = await this.getSource(sourceId);
         if (!source || source.user_id !== this.userId) {
-            throw new Error('Source not found');
+            throw new NotFoundError('Source', sourceId);
         }
 
         if (source.storage_path) {
-            await storage.remove([source.storage_path]);
+            const removal = await storage.remove([source.storage_path]);
+            if (removal.error) {
+                console.warn('[LearningService] Failed to remove storage object:', removal.error);
+            }
         }
 
-        // Deleting the source will implicitly cascade delete chunks due to onDelete: Cascade on Prisma schema
-        await prisma.learningSource.delete({
-            where: { id: sourceId }
+        // Delete with user scope to avoid race-induced P2025 errors leaking as 500s.
+        const result = await prisma.learningSource.deleteMany({
+            where: { id: sourceId, user_id: this.userId }
         });
+
+        if (result.count === 0) {
+            throw new NotFoundError('Source', sourceId);
+        }
     }
 
     async checkDuplicate(
-        conversationId: string,
+        conversationId: string | null,
         contentHash: string
     ): Promise<LearningSourceRow | null> {
         const data = await prisma.learningSource.findFirst({
             where: {
                 user_id: this.userId,
-                conversation_id: conversationId,
+                ...(conversationId ? { conversation_id: conversationId } : { conversation_id: null }),
                 metadata: { path: ['hash'], equals: contentHash }
             }
         });
@@ -154,17 +197,52 @@ export class LearningService {
         return data ? { ...data, created_at: data.created_at.toISOString(), updated_at: data.updated_at.toISOString(), conversation_id: data.conversation_id || null } as unknown as LearningSourceRow : null;
     }
 
-    async processSource(sourceId: string): Promise<ProcessingResult> {
+    async processSource(
+        sourceId: string,
+        options: ProcessSourceOptions = {}
+    ): Promise<ProcessingResult> {
         const startTime = Date.now();
 
         try {
-            // 1. Atomically claim processing
-            const claimed = await prisma.learningSource.update({
-                where: { id: sourceId, status: 'pending' },
-                data: { status: 'processing' }
-            });
+            let source: LearningSourceRow;
 
-            const source = { ...claimed, created_at: claimed.created_at.toISOString(), updated_at: claimed.updated_at.toISOString() } as unknown as LearningSourceRow;
+            if (options.skipClaim) {
+                if (options.preclaimedSource) {
+                    source = options.preclaimedSource;
+                } else {
+                    const existing = await this.getSource(sourceId);
+                    if (!existing) {
+                        return { success: false, chunks_created: 0, error: 'Source not found' };
+                    }
+                    source = existing;
+                }
+
+                if (source.status !== 'processing') {
+                    const updated = await prisma.learningSource.update({
+                        where: { id: sourceId },
+                        data: { status: 'processing' },
+                    });
+                    source = {
+                        ...updated,
+                        created_at: updated.created_at.toISOString(),
+                        updated_at: updated.updated_at.toISOString(),
+                        conversation_id: updated.conversation_id || null,
+                    } as unknown as LearningSourceRow;
+                }
+            } else {
+                // 1. Atomically claim processing
+                const claimed = await prisma.learningSource.update({
+                    where: { id: sourceId, status: 'pending' },
+                    data: { status: 'processing' }
+                });
+
+                source = {
+                    ...claimed,
+                    created_at: claimed.created_at.toISOString(),
+                    updated_at: claimed.updated_at.toISOString(),
+                    conversation_id: claimed.conversation_id || null,
+                } as unknown as LearningSourceRow;
+            }
 
             // 2. Download file from storage
             if (!source.storage_path) throw new Error("No storage path provided for source");
@@ -192,25 +270,49 @@ export class LearningService {
             // 5. Extract text
             const extraction = await extractText(buffer, source.file_type!);
 
-            // 6. Validate extraction quality
-            if (!extraction.text || isGarbageText(extraction.text)) {
-                throw new Error('Unable to extract meaningful text from file');
+            // 6. Normalize + validate extraction quality
+            const normalizedText = normalizeText(extraction.text ?? '');
+            if (!normalizedText) {
+                throw new Error('Unable to extract text from file');
             }
-
-            // 7. Normalize text
-            const normalizedText = normalizeText(extraction.text);
+            // Keep OCR quality checks for images, but don't reject non-Latin documents as "garbage".
+            if (source.file_type === 'image' && isGarbageText(normalizedText)) {
+                throw new Error('OCR result is too noisy. Please upload a clearer image or higher-resolution scan.');
+            }
+            if (normalizedText.length < 30) {
+                throw new Error('Extracted text is too short to build a learning source');
+            }
 
             // 8. Chunk text
             const chunking = chunkText(normalizedText);
+            if (!chunking.chunks.length) {
+                throw new Error('Unable to split extracted text into chunks');
+            }
 
             // 9. Save chunks
             await this.saveChunks(sourceId, chunking.chunks);
+
+            // 9.5 Generate embeddings for chunks
+            const { EmbeddingService } = await import('@/lib/embeddings/service');
+            const embeddingService = new EmbeddingService();
+            const embeddingResult = await embeddingService.embedSourceChunks(sourceId);
+
+            if (embeddingResult.success.length === 0) {
+                throw new Error(
+                    'No embeddings were generated. Install an Ollama embedding model (example: ollama pull nomic-embed-text) and set AI_EMBEDDING_MODEL or OLLAMA_EMBEDDING_MODEL.'
+                );
+            }
+            if (embeddingResult.failed.length > 0) {
+                console.error(`[LearningService] Failed to embed ${embeddingResult.failed.length} chunks`);
+            }
 
             // 10. Update source with success
             const processingTime = Date.now() - startTime;
             await this.updateSourceStatus(sourceId, 'completed', {
                 ...extraction.metadata,
                 chunk_count: chunking.chunks.length,
+                embeddings_generated: embeddingResult.success.length,
+                embeddings_failed: embeddingResult.failed.length,
                 processing_time_ms: processingTime,
                 hash,
             });
@@ -218,6 +320,7 @@ export class LearningService {
             return { success: true, chunks_created: chunking.chunks.length };
 
         } catch (error) {
+            console.error('[LearningService] processSource failed:', error);
             // Prisma will throw error if trying to update but it is NOT `pending` in the condition.
             if ((error as any).code === 'P2025') {
                 return { success: false, chunks_created: 0, error: 'Source not available for processing' };
@@ -275,12 +378,13 @@ export class LearningService {
     }
 
     generateStoragePath(
-        conversationId: string,
+        conversationId: string | null,
         filename: string
     ): string {
         const sanitized = sanitizeFilename(filename);
         const timestamp = Date.now();
-        return `${this.userId}/${conversationId}/${timestamp}_${sanitized}`;
+        const convoPart = conversationId || 'global';
+        return `${this.userId}/${convoPart}/${timestamp}_${sanitized}`;
     }
 
     private generateTitle(filename: string): string {

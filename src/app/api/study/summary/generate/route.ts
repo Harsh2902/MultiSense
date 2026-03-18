@@ -49,12 +49,24 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
         throw new NotFoundError('Conversation', conversation_id);
     }
 
-    const summaryService = new SummaryService(auth.userId);
-    const result = await summaryService.generateSummary(
-        conversation_id,
-        summary_type as SummaryType,
-        topic
-    );
+    try {
+        const summaryService = new SummaryService(auth.userId);
+        const result = await summaryService.generateSummary(
+            conversation_id,
+            summary_type as SummaryType,
+            topic
+        );
 
-    return NextResponse.json<SummaryResponse>(result, { status: 201 });
-});
+        return NextResponse.json<SummaryResponse>(result, { status: 201 });
+    } catch (error: any) {
+        try {
+            const fs = await import('fs');
+            const path = await import('path');
+            const logFile = path.join(process.cwd(), 'youtube-debug.log');
+            const errorMsg = error instanceof Error ? `[Summary API Error] ${error.message}\n${error.stack}` : `[Summary API Error] ${JSON.stringify(error)}`;
+            fs.appendFileSync(logFile, `${new Date().toISOString()}: ${errorMsg}\n`);
+        } catch { }
+
+        throw error;
+    }
+}, { timeoutMs: 180_000 });

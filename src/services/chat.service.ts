@@ -42,6 +42,15 @@ export interface CreateConversationOptions {
 export class ChatService {
     constructor(private userId: string) { }
 
+    private safeIso(value: Date | string | null | undefined): string {
+        if (!value) {
+            return new Date().toISOString();
+        }
+
+        const date = value instanceof Date ? value : new Date(value);
+        return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+    }
+
     // ===========================================================================
     // Conversation Operations
     // ===========================================================================
@@ -80,51 +89,199 @@ export class ChatService {
             ...(cursor ? { updated_at: { lt: new Date(cursor) } } : {})
         };
 
-        const [items, total] = await Promise.all([
-            prisma.conversation.findMany({
-                where,
-                take: limit + 1,
-                orderBy: { updated_at: 'desc' },
-                include: {
-                    messages: {
-                        take: 1,
-                        orderBy: { created_at: 'desc' },
-                        select: { content: true, role: true, created_at: true }
-                    },
-                    _count: { select: { messages: true } }
-                }
-            }),
-            prisma.conversation.count({ where: { user_id: this.userId, ...(mode ? { mode } : {}) } })
-        ]);
+        try {
+            const [items, total] = await Promise.all([
+                prisma.conversation.findMany({
+                    where,
+                    take: limit + 1,
+                    orderBy: { updated_at: 'desc' },
+                    include: {
+                        messages: {
+                            take: 1,
+                            orderBy: { created_at: 'desc' },
+                            select: { content: true, role: true, created_at: true }
+                        },
+                        _count: { select: { messages: true } }
+                    }
+                }),
+                prisma.conversation.count({ where: { user_id: this.userId, ...(mode ? { mode } : {}) } })
+            ]);
 
-        const hasMore = items.length > limit;
-        const conversations = items.slice(0, limit);
+            const hasMore = items.length > limit;
+            const conversations = items.slice(0, limit);
 
-        const result: ConversationWithPreview[] = conversations.map(conv => {
-            const lastMessage = conv.messages[0];
+            const result: ConversationWithPreview[] = conversations.map(conv => {
+                const lastMessage = conv.messages[0];
+                const safeMode = conv.mode === 'learning' ? 'learning' : 'chat';
+                const preview = typeof lastMessage?.content === 'string'
+                    ? lastMessage.content.substring(0, 100)
+                    : '';
+
+                return {
+                    id: conv.id,
+                    user_id: conv.user_id,
+                    title: conv.title || 'Untitled',
+                    mode: safeMode,
+                    settings: (conv.settings ?? {}) as unknown as ConversationSettings,
+                    created_at: this.safeIso(conv.created_at),
+                    updated_at: this.safeIso(conv.updated_at),
+                    last_message: lastMessage ? {
+                        content: preview,
+                        role: (lastMessage.role as 'user' | 'assistant' | 'system') || 'assistant',
+                        created_at: this.safeIso(lastMessage.created_at),
+                    } : undefined,
+                    message_count: conv._count.messages ?? 0,
+                };
+            });
+
             return {
-                id: conv.id,
-                user_id: conv.user_id,
-                title: conv.title,
-                mode: conv.mode as 'chat' | 'learning',
-                settings: conv.settings as unknown as ConversationSettings,
-                created_at: conv.created_at.toISOString(),
-                updated_at: conv.updated_at.toISOString(),
-                last_message: lastMessage ? {
-                    content: lastMessage.content.substring(0, 100),
-                    role: lastMessage.role as 'user' | 'assistant' | 'system',
-                    created_at: lastMessage.created_at.toISOString(),
-                } : undefined,
-                message_count: conv._count.messages,
+                data: result,
+                count: total,
+                has_more: hasMore,
+                next_cursor: hasMore ? this.safeIso(conversations[conversations.length - 1]?.updated_at) : undefined,
             };
-        });
+        } catch (error) {
+            console.error('[ChatService] listConversations primary query failed, using fallback:', error);
+            try {
+                const items = await prisma.conversation.findMany({
+                    where,
+                    take: limit + 1,
+                    orderBy: { updated_at: 'desc' },
+                });
 
-        return {
-            data: result,
-            count: total,
-            has_more: hasMore,
-            next_cursor: hasMore ? conversations[conversations.length - 1]?.updated_at.toISOString() : undefined,
-        };
+                const hasMore = items.length > limit;
+                const conversations = items.slice(0, limit);
+                const ids = conversations.map((c) => c.id);
+
+                const [messageCounts, lastMessages, total] = await Promise.all([
+                    ids.length > 0
+                        ? prisma.message.groupBy({
+                            by: ['conversation_id'],
+                            where: { conversation_id: { in: ids } },
+                            _count: { _all: true },
+                        })
+                        : [],
+                    Promise.all(ids.map(async (id) => {
+                        const msg = await prisma.message.findFirst({
+                            where: { conversation_id: id },
+                            orderBy: { created_at: 'desc' },
+                            select: { content: true, role: true, created_at: true },
+                        });
+                        return [id, msg] as const;
+                    })),
+                    prisma.conversation.count({ where: { user_id: this.userId, ...(mode ? { mode } : {}) } }),
+                ]);
+
+                const countMap = new Map(messageCounts.map((row) => [row.conversation_id, row._count._all]));
+                const lastMessageMap = new Map(lastMessages);
+
+                const result: ConversationWithPreview[] = conversations.map((conv) => {
+                    const lastMessage = lastMessageMap.get(conv.id);
+                    const safeMode = conv.mode === 'learning' ? 'learning' : 'chat';
+                    const preview = typeof lastMessage?.content === 'string'
+                        ? lastMessage.content.substring(0, 100)
+                        : '';
+
+                    return {
+                        id: conv.id,
+                        user_id: conv.user_id,
+                        title: conv.title || 'Untitled',
+                        mode: safeMode,
+                        settings: (conv.settings ?? {}) as unknown as ConversationSettings,
+                        created_at: this.safeIso(conv.created_at),
+                        updated_at: this.safeIso(conv.updated_at),
+                        last_message: lastMessage ? {
+                            content: preview,
+                            role: (lastMessage.role as 'user' | 'assistant' | 'system') || 'assistant',
+                            created_at: this.safeIso(lastMessage.created_at),
+                        } : undefined,
+                        message_count: countMap.get(conv.id) ?? 0,
+                    };
+                });
+
+                return {
+                    data: result,
+                    count: total,
+                    has_more: hasMore,
+                    next_cursor: hasMore ? this.safeIso(conversations[conversations.length - 1]?.updated_at) : undefined,
+                };
+            } catch (fallbackError) {
+                console.error('[ChatService] listConversations fallback failed, trying source-linked recovery:', fallbackError);
+
+                try {
+                    const sourceRows = await prisma.learningSource.findMany({
+                        where: {
+                            user_id: this.userId,
+                            conversation_id: { not: null },
+                        },
+                        orderBy: { created_at: 'desc' },
+                        take: 200,
+                        select: {
+                            conversation_id: true,
+                            title: true,
+                            created_at: true,
+                        },
+                    });
+
+                    const dedupedConversationIds = Array.from(
+                        new Set(
+                            sourceRows
+                                .map((row) => row.conversation_id)
+                                .filter((id): id is string => !!id)
+                        )
+                    ).slice(0, limit + 1);
+
+                    if (dedupedConversationIds.length === 0) {
+                        return {
+                            data: [],
+                            count: 0,
+                            has_more: false,
+                        };
+                    }
+
+                    const conversations = await prisma.conversation.findMany({
+                        where: {
+                            id: { in: dedupedConversationIds },
+                        },
+                        include: {
+                            _count: { select: { messages: true } },
+                        },
+                        orderBy: { updated_at: 'desc' },
+                    });
+
+                    const hasMore = conversations.length > limit;
+                    const sliced = conversations.slice(0, limit);
+
+                    const result: ConversationWithPreview[] = sliced.map((conv) => {
+                        const safeMode = conv.mode === 'learning' ? 'learning' : 'chat';
+                        return {
+                            id: conv.id,
+                            user_id: conv.user_id,
+                            title: conv.title || 'Untitled',
+                            mode: safeMode,
+                            settings: (conv.settings ?? {}) as unknown as ConversationSettings,
+                            created_at: this.safeIso(conv.created_at),
+                            updated_at: this.safeIso(conv.updated_at),
+                            message_count: conv._count.messages ?? 0,
+                        };
+                    });
+
+                    return {
+                        data: result,
+                        count: result.length,
+                        has_more: hasMore,
+                        next_cursor: hasMore ? this.safeIso(sliced[sliced.length - 1]?.updated_at) : undefined,
+                    };
+                } catch (recoveryError) {
+                    console.error('[ChatService] source-linked recovery failed. Returning empty history:', recoveryError);
+                    return {
+                        data: [],
+                        count: 0,
+                        has_more: false,
+                    };
+                }
+            }
+        }
     }
 
     async updateConversation(conversationId: string, updates: Prisma.ConversationUpdateInput): Promise<ConversationRow> {

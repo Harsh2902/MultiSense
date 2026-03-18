@@ -27,6 +27,16 @@ import { LearningService } from '@/services/learning.service';
 import { logger } from '@/lib/logger';
 import { trackQueueJob } from '@/lib/metrics';
 
+const NON_RETRYABLE_YOUTUBE_CODES = new Set([
+    'INVALID_URL',
+    'VIDEO_UNAVAILABLE',
+    'VIDEO_TOO_LONG',
+    'DUPLICATE',
+    'NO_CONTENT',
+    'INSUFFICIENT_CONTENT',
+    'INVALID_SOURCE',
+]);
+
 function logToFile(message: string) {
     try {
         const fs = require('fs');
@@ -53,9 +63,9 @@ export interface ProcessorConfig {
 
 const DEFAULT_CONFIG: ProcessorConfig = {
     batchSize: 5,
-    processingTimeoutMs: 300000,  // 5 minutes per source
+    processingTimeoutMs: Number(process.env.QUEUE_PROCESSING_TIMEOUT_MS || 12 * 60 * 1000),
     maxRetries: 3,
-    staleThresholdMs: 600000,    // 10 minutes
+    staleThresholdMs: Number(process.env.QUEUE_STALE_THRESHOLD_MS || 20 * 60 * 1000),
 };
 
 // =============================================================================
@@ -107,6 +117,24 @@ export async function processPendingSources(
             );
 
             const processingTimeMs = Date.now() - startTime;
+            if (!result.success) {
+                const errorMessage = result.error || 'Processing returned unsuccessful result';
+                trackQueueJob('process_source', 'failed', processingTimeMs);
+                logger.warn('Source processing returned failure result', {
+                    sourceId: source.id,
+                    error: errorMessage,
+                    processingTimeMs,
+                });
+                logToFile(`FAILURE: Source ${source.id} returned unsuccessful result: ${errorMessage}`);
+                results.push({
+                    sourceId: source.id,
+                    success: false,
+                    error: errorMessage,
+                    processingTimeMs,
+                });
+                continue;
+            }
+
             trackQueueJob('process_source', 'completed', processingTimeMs);
             logger.info('Source processed successfully', {
                 sourceId: source.id,
@@ -126,31 +154,39 @@ export async function processPendingSources(
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
             const processingTimeMs = Date.now() - startTime;
+            const errorCode = (error as any)?.code as string | undefined;
 
             logToFile(`FAILURE: Source ${source.id} failed after ${processingTimeMs}ms: ${errorMessage}`);
             trackQueueJob('process_source', 'failed', processingTimeMs);
 
             const md = source.metadata as Record<string, any>;
-            const currentAttempts = md?.retry_count ?? 1;
+            const currentAttempts = Number(md?.retry_count ?? 0);
+            const attemptNumber = currentAttempts + 1;
             const maxAttempts = cfg.maxRetries;
+            const isNonRetryableYouTube =
+                source.source_type === 'youtube' &&
+                !!errorCode &&
+                NON_RETRYABLE_YOUTUBE_CODES.has(errorCode);
 
-            if (currentAttempts < maxAttempts) {
+            if (!isNonRetryableYouTube && attemptNumber < maxAttempts) {
                 logger.warn('Source processing failed, will retry', {
                     sourceId: source.id,
-                    attempt: currentAttempts,
+                    attempt: attemptNumber,
                     maxAttempts,
                     error: errorMessage,
+                    errorCode,
                 });
                 await updateSourceStatus(source.id, 'pending', {
                     last_error: errorMessage,
-                    retry_count: currentAttempts + 1
+                    retry_count: attemptNumber
                 });
             } else {
                 logger.error('Source processing permanently failed', error instanceof Error ? error : new Error(errorMessage), {
                     sourceId: source.id,
-                    attempts: currentAttempts,
+                    attempts: attemptNumber,
+                    errorCode,
                 });
-                await updateSourceStatus(source.id, 'failed', { retry_count: currentAttempts }, errorMessage);
+                await updateSourceStatus(source.id, 'failed', { retry_count: attemptNumber }, errorMessage);
             }
 
             results.push({
@@ -171,7 +207,7 @@ export async function processPendingSources(
 
 async function processSource(
     source: LearningSourceRow
-): Promise<{ success: boolean; chunks_created: number }> {
+): Promise<{ success: boolean; chunks_created: number; error?: string }> {
     if (source.source_type === 'youtube') {
         const { YouTubeService } = await import('@/services/youtube.service');
         const youtubeService = new YouTubeService(source.user_id);
@@ -183,7 +219,10 @@ async function processSource(
     }
 
     const learningService = new LearningService(source.user_id);
-    return learningService.processSource(source.id);
+    return learningService.processSource(source.id, {
+        skipClaim: true,
+        preclaimedSource: source,
+    });
 }
 
 async function claimPendingSources(
@@ -193,10 +232,10 @@ async function claimPendingSources(
     try {
         // Raw PG query to atomically UPDATE returning claims
         let query = `
-            UPDATE "LearningSource"
+            UPDATE "learning_sources"
             SET status = 'processing', updated_at = NOW()
             WHERE id IN (
-                SELECT id FROM "LearningSource"
+                SELECT id FROM "learning_sources"
                 WHERE status = 'pending'
                 ${userId ? `AND user_id = '${userId.replace(/'/g, "''")}'` : ''}
                 ORDER BY created_at ASC

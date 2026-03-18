@@ -17,8 +17,14 @@ import type {
 // Conversations
 // =============================================================================
 
-export async function fetchConversations(cursor?: string): Promise<PaginatedResponse<ConversationWithPreview>> {
-    const params = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+export async function fetchConversations(
+    cursor?: string,
+    mode?: 'chat' | 'learning'
+): Promise<PaginatedResponse<ConversationWithPreview>> {
+    const query = new URLSearchParams();
+    if (cursor) query.set('cursor', cursor);
+    if (mode) query.set('mode', mode);
+    const params = query.toString() ? `?${query.toString()}` : '';
     return api.get<PaginatedResponse<ConversationWithPreview>>(`/api/chat/conversations${params}`);
 }
 
@@ -63,6 +69,7 @@ export async function fetchMessages(
 export async function sendMessageStream(
     conversationId: string,
     content: string,
+    sourceId?: string,
     signal?: AbortSignal
 ): Promise<Response> {
     const csrfMeta = typeof document !== 'undefined'
@@ -76,7 +83,11 @@ export async function sendMessageStream(
             'Content-Type': 'application/json',
             'X-CSRF-Token': csrfToken,
         },
-        body: JSON.stringify({ conversation_id: conversationId, content }),
+        body: JSON.stringify({
+            conversation_id: conversationId,
+            content,
+            ...(sourceId ? { source_id: sourceId } : {}),
+        }),
         signal,
     });
 

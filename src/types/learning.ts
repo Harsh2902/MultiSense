@@ -69,7 +69,7 @@ export const MAGIC_BYTES: Record<string, number[]> = {
 export interface LearningSourceRow {
     id: string;
     user_id: string;
-    conversation_id: string;
+    conversation_id: string | null;
     source_type: SourceType;
     title: string;
     original_filename: string | null;
@@ -220,7 +220,7 @@ export interface FileValidationResult {
 export interface ProcessingJob {
     source_id: string;
     user_id: string;
-    conversation_id: string;
+    conversation_id: string | null;
     status: ProcessingStatus;
     progress: number;          // 0-100
     current_step: string;

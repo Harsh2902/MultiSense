@@ -12,6 +12,7 @@ import { debitTokenBudget } from '@/lib/token-governance';
 import { BudgetExceededError } from '@/lib/errors';
 import { logger } from '@/lib/logger';
 import type { ApiError, MessageMetadata } from '@/types/chat';
+import { prisma } from '@/lib/prisma';
 
 // =============================================================================
 // In-Flight Request Tracking (Double-Submit Prevention)
@@ -97,7 +98,7 @@ export async function POST(request: NextRequest): Promise<Response> {
         );
     }
 
-    const { conversation_id, content } = validationResult.data;
+    const { conversation_id, content, source_id } = validationResult.data;
 
     // 5. Verify conversation exists AND belongs to user (explicit ownership check)
     const chatService = new ChatService(auth.userId);
@@ -119,6 +120,37 @@ export async function POST(request: NextRequest): Promise<Response> {
         );
     }
 
+    let scopedSource: { id: string; title: string; status: string; conversation_id: string | null } | null = null;
+    if (source_id) {
+        const source = await prisma.learningSource.findUnique({
+            where: { id: source_id, user_id: auth.userId },
+            select: { id: true, title: true, status: true, conversation_id: true },
+        });
+
+        if (!source) {
+            return NextResponse.json<ApiError>(
+                { error: 'Learning source not found', code: 'NOT_FOUND' },
+                { status: 404 }
+            );
+        }
+
+        if (source.status !== 'completed') {
+            return NextResponse.json<ApiError>(
+                { error: 'Learning source is not ready for chat yet', code: 'CONFLICT' },
+                { status: 409 }
+            );
+        }
+
+        if (source.conversation_id && source.conversation_id !== conversation_id) {
+            return NextResponse.json<ApiError>(
+                { error: 'Learning source is linked to another chat', code: 'CONFLICT' },
+                { status: 409 }
+            );
+        }
+
+        scopedSource = source;
+    }
+
     // 6. Double-submit prevention (backend)
     if (!acquireLock(conversation_id)) {
         return NextResponse.json<ApiError>(
@@ -136,7 +168,8 @@ export async function POST(request: NextRequest): Promise<Response> {
         const userMessage = await chatService.addMessage(
             conversation_id,
             'user',
-            content
+            content,
+            source_id ? { source_id, scoped_learning_chat: true } : {}
         );
 
         // 8. Get conversation history for context
@@ -144,22 +177,24 @@ export async function POST(request: NextRequest): Promise<Response> {
 
         // 9. Build context window with error handling for token limits
         let systemPrompt = conversation.settings?.system_prompt as string | undefined;
+        let sourceNoContextResponse: string | null = null;
 
-        // INJECT RAG CONTEXT (for 'learning' mode)
-        if (conversation.mode === 'learning') {
-            try {
-                // Log RAG attempt
-                try {
-                    const fs = await import('fs');
-                    const path = await import('path');
-                    fs.appendFileSync(path.join(process.cwd(), 'youtube-debug.log'), `[Chat] ${new Date().toISOString()}: Attempting RAG for conversation ${conversation_id}\n`);
-                } catch { }
+        // INJECT RAG CONTEXT (for all modes — uploaded documents should always be queryable)
+        try {
+            const { RagService } = await import('@/services/rag.service');
+            const ragService = new RagService(auth.userId);
 
-                const { RagService } = await import('@/services/rag.service');
-                const ragService = new RagService(auth.userId);
-
-                // Retrieve relevant chunks for the user's query
-                const ragContext = await ragService.retrieveContext(
+            // Retrieve relevant chunks for the user's query
+            const ragContext = source_id
+                ? await ragService.retrieveContextBySource(
+                    source_id,
+                    content,
+                    {
+                        k: 5,
+                        threshold: 0.5
+                    }
+                )
+                : await ragService.retrieveContext(
                     conversation_id,
                     content,
                     {
@@ -168,36 +203,26 @@ export async function POST(request: NextRequest): Promise<Response> {
                     }
                 );
 
-                try {
-                    const fs = await import('fs');
-                    const path = await import('path');
-                    fs.appendFileSync(path.join(process.cwd(), 'youtube-debug.log'), `[Chat] ${new Date().toISOString()}: RAG retrieved ${ragContext.chunks.length} chunks. Token count: ${ragContext.tokenCount}\n`);
-                } catch { }
+            console.log(`[Chat] RAG retrieved ${ragContext.chunks.length} chunks for ${source_id ? `source ${source_id}` : `conversation ${conversation_id}`}`);
 
-                if (ragContext.chunks.length > 0) {
-                    const contextBlock = ragContext.chunks
-                        .map(r => `[Source: ${r.sourceMetadata?.title || 'Unknown'}]\n${r.content}`)
-                        .join('\n\n');
+            if (ragContext.chunks.length > 0) {
+                const contextBlock = ragContext.chunks
+                    .map(r => `[Source: ${r.sourceMetadata?.title || 'Unknown'}]\n${r.content}`)
+                    .join('\n\n');
 
-                    const ragInstruction = `\n\nRelevant context from uploaded materials:\n${contextBlock}\n\nAnswer strictly based on the provided context. If the answer is not in the context, say so.`;
+                const ragInstruction = source_id
+                    ? `\n\nYou are in a learning-source scoped chat for "${scopedSource?.title || 'Selected Source'}". Use ONLY this source context:\n${contextBlock}\n\nIf the answer is not explicitly in this source context, say that it is not available in this learning source.`
+                    : `\n\nRelevant context from uploaded materials:\n${contextBlock}\n\nAnswer strictly based on the provided context. If the answer is not in the context, say so.`;
 
-                    systemPrompt = (systemPrompt || 'You are a helpful AI tutor.') + ragInstruction;
-                }
-            } catch (ragError) {
-                console.error('[Chat] RAG retrieval failed:', ragError);
-                try {
-                    const fs = await import('fs');
-                    const path = await import('path');
-                    fs.appendFileSync(path.join(process.cwd(), 'youtube-debug.log'), `[Chat] ${new Date().toISOString()}: RAG failed: ${ragError}\n`);
-                } catch { }
-                // Continue without RAG context rather than failing the whole request
+                systemPrompt = (systemPrompt || 'You are a helpful AI learning companion.') + ragInstruction;
+            } else if (source_id) {
+                const strictNoContextInstruction = `\n\nYou are in a learning-source scoped chat for "${scopedSource?.title || 'Selected Source'}". No relevant context was found for this question in this source. Respond that the answer is not available in this learning source.`;
+                systemPrompt = (systemPrompt || 'You are a helpful AI learning companion.') + strictNoContextInstruction;
+                sourceNoContextResponse = 'This is not available in the selected learning source.';
             }
-        } else {
-            try {
-                const fs = await import('fs');
-                const path = await import('path');
-                fs.appendFileSync(path.join(process.cwd(), 'youtube-debug.log'), `[Chat] ${new Date().toISOString()}: Skipping RAG. Mode is ${conversation.mode}\n`);
-            } catch { }
+        } catch (ragError) {
+            console.error('[Chat] RAG retrieval failed:', ragError);
+            // Continue without RAG context rather than failing the whole request
         }
 
         const contextWindow = buildContextWindow(history, systemPrompt);
@@ -222,7 +247,9 @@ export async function POST(request: NextRequest): Promise<Response> {
             conversation_id,
             'assistant',
             '', // Empty content, will be updated during streaming
-            { streaming: true } // Mark as streaming in progress
+            source_id
+                ? { streaming: true, source_id, scoped_learning_chat: true }
+                : { streaming: true } // Mark as streaming in progress
         );
 
         // 11. Create streaming response
@@ -248,6 +275,38 @@ export async function POST(request: NextRequest): Promise<Response> {
 
                     // Stream AI response with error handling
                     try {
+                        if (sourceNoContextResponse) {
+                            fullContent = sourceNoContextResponse;
+                            tokenCount = 1;
+
+                            await chatService.updateMessage(placeholderMessage.id, {
+                                content: fullContent,
+                                metadata: {
+                                    finish_reason: 'source_no_context',
+                                    streaming: false,
+                                    source_id,
+                                    scoped_learning_chat: true,
+                                } as any,
+                                token_count: tokenCount,
+                            });
+
+                            controller.enqueue(
+                                encoder.encode(`data: ${JSON.stringify({
+                                    type: 'token',
+                                    content: fullContent
+                                })}\n\n`)
+                            );
+
+                            controller.enqueue(
+                                encoder.encode(`data: ${JSON.stringify({
+                                    type: 'done',
+                                    message_id: placeholderMessage.id,
+                                    token_count: tokenCount,
+                                })}\n\n`)
+                            );
+                            return;
+                        }
+
                         const { LLM_MODELS } = await import('@/config/models');
                         for await (const chunk of gateway.stream({
                             messages: contextWindow.messages,

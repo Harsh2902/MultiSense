@@ -52,4 +52,4 @@ export const POST = withApiHandler(async (request: NextRequest): Promise<NextRes
     const result = await flashcardService.generateFlashcards(conversation_id, topic);
 
     return NextResponse.json<FlashcardSetResponse>(result, { status: 201 });
-});
+}, { timeoutMs: 180_000 });

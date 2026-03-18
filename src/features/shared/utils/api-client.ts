@@ -128,12 +128,19 @@ export async function apiClient<T>(
             // Try to parse structured error
             const errorBody = data as Record<string, unknown>;
             const errorData = errorBody?.error as Record<string, unknown> | undefined;
+            const topLevelMessage = typeof errorBody?.message === 'string'
+                ? errorBody.message
+                : undefined;
+            const topLevelCode = typeof errorBody?.code === 'string'
+                ? errorBody.code
+                : undefined;
 
             throw new ApiClientError({
                 message: (errorData?.message as string)
+                    || topLevelMessage
                     || (errorBody?.error as string)
                     || `Request failed with status ${response.status}`,
-                code: (errorData?.code as string) || 'UNKNOWN_ERROR',
+                code: (errorData?.code as string) || topLevelCode || 'UNKNOWN_ERROR',
                 statusCode: response.status,
                 requestId: (errorData?.requestId as string) || requestId,
                 details: errorData?.details as Record<string, unknown>,

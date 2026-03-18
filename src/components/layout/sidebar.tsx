@@ -1,10 +1,10 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
-import { Plus, MessageSquare, BookOpen, GraduationCap, Settings, LogOut, PanelLeftClose, PanelLeftOpen, Trash2 } from 'lucide-react';
+import { Plus, MessageSquare, BookOpen, Settings, LogOut, PanelLeftClose, PanelLeftOpen, Trash2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useUser, useClerk } from '@clerk/nextjs';
 import {
@@ -15,7 +15,7 @@ import {
     DropdownMenuSeparator,
     DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { useConversations, useDeleteConversation } from '@/hooks/use-conversations';
+import { useConversations, useDeleteConversation, useLearningSources } from '@/hooks/use-conversations';
 import { useEffect, useState } from 'react';
 import {
     AlertDialog,
@@ -32,26 +32,43 @@ import {
 
 export function Sidebar() {
     const pathname = usePathname();
+    const searchParams = useSearchParams();
     const router = useRouter();
     const [isCollapsed, setIsCollapsed] = useState(false);
     const [isGuest, setIsGuest] = useState(false);
     const [isChecked, setIsChecked] = useState(false);
 
-    const { user, isLoaded } = useUser();
+    const { user } = useUser();
     const { signOut } = useClerk();
 
     useEffect(() => {
-        setIsGuest(document.cookie.includes('demo_session=true'));
+        const hasDemoCookie = document.cookie
+            .split(';')
+            .some((cookie) => cookie.trim().startsWith('demo_session=true'));
+        setIsGuest(hasDemoCookie && !user?.id);
         setIsChecked(true);
-    }, []);
+    }, [user?.id]);
 
     const { mutate: deleteConversationMutation } = useDeleteConversation();
 
-    const { data: conversationList, isLoading } = useConversations({
-        enabled: isChecked && !isGuest
+    const isLearningMode = pathname?.startsWith('/learning') ?? false;
+    const isChatMode = pathname?.startsWith('/chat') ?? false;
+    const activeChatId = searchParams?.get('id');
+    const activeSourceId = isLearningMode ? pathname?.split('/')[2] ?? null : null;
+
+    const chatQuery = useConversations({
+        enabled: isChecked && !isGuest && !isLearningMode,
+        mode: 'chat',
     });
-    // Only show real conversations. For guests, this will likely be empty.
-    const conversations = conversationList || [];
+    const learningQuery = useLearningSources({
+        enabled: isChecked && !isGuest && isLearningMode,
+    });
+
+    const isLoading = isLearningMode ? learningQuery.isLoading : chatQuery.isLoading;
+    const error = isLearningMode ? learningQuery.error : chatQuery.error;
+    const refetch = isLearningMode ? learningQuery.refetch : chatQuery.refetch;
+    const conversations = chatQuery.data || [];
+    const learningSources = learningQuery.data || [];
 
     return (
         <motion.div
@@ -66,12 +83,12 @@ export function Sidebar() {
             <div className="p-3 flex items-center justify-between">
                 {!isCollapsed && (
                     <Button
-                        onClick={() => router.push('/chat')}
+                        onClick={() => router.push(isLearningMode ? '/learning' : '/chat')}
                         variant="outline"
                         className="flex-1 justify-start gap-2 bg-zinc-900 border-zinc-700 hover:bg-zinc-800 text-zinc-100"
                     >
                         <Plus className="h-4 w-4" />
-                        <span>New Chat</span>
+                        <span>{isLearningMode ? 'New Source Chat' : 'New Chat'}</span>
                     </Button>
                 )}
 
@@ -101,23 +118,98 @@ export function Sidebar() {
                     active={pathname?.startsWith('/learning')}
                     collapsed={isCollapsed}
                 />
-                <NavItem
-                    href="/study"
-                    icon={<GraduationCap className="h-5 w-5" />}
-                    label="Study Tools"
-                    active={pathname?.startsWith('/study')}
-                    collapsed={isCollapsed}
-                />
             </div>
 
             {/* History List (Scrollable) */}
             <div className="flex-1 overflow-y-auto px-3 py-2">
                 {!isCollapsed && (
-                    <div className="text-xs font-semibold text-zinc-500 mb-2">Recent</div>
+                    <div className="text-xs font-semibold text-zinc-500 mb-2">
+                        {isLearningMode ? 'Sources' : 'Recent'}
+                    </div>
                 )}
                 <div className="space-y-1">
                     {isLoading ? (
                         <div className="p-2 text-xs text-zinc-500">Loading...</div>
+                    ) : error ? (
+                        <div className="p-2 space-y-2">
+                            <div className="text-xs text-red-400">
+                                {isLearningMode ? 'Failed to load sources' : 'Failed to load history'}
+                            </div>
+                            <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 px-2 text-xs text-zinc-400 hover:text-white"
+                                onClick={() => {
+                                    void refetch();
+                                }}
+                            >
+                                Retry
+                            </Button>
+                        </div>
+                    ) : isLearningMode ? (
+                        <AnimatePresence>
+                            <motion.div
+                                key="learning-home"
+                                initial={{ opacity: 0, x: -10 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                className="group relative"
+                            >
+                                <Link href="/learning" className="block w-full">
+                                    <Button
+                                        variant="ghost"
+                                        className={cn(
+                                            "w-full justify-start text-sm font-normal text-zinc-300 hover:bg-zinc-800/50 hover:text-white h-auto py-2",
+                                            pathname === '/learning' && "bg-zinc-800 text-white",
+                                            isCollapsed && "justify-center px-0",
+                                        )}
+                                    >
+                                        {!isCollapsed ? (
+                                            <span className="truncate text-left w-full">New Chat</span>
+                                        ) : (
+                                            <Plus className="h-4 w-4 shrink-0" />
+                                        )}
+                                    </Button>
+                                </Link>
+                            </motion.div>
+                            {learningSources.length === 0 ? (
+                                <div className="p-2 text-xs text-zinc-500">No sources yet</div>
+                            ) : (
+                                learningSources.map((source: any, index: number) => (
+                                    <motion.div
+                                        key={source.id}
+                                        initial={{ opacity: 0, x: -10 }}
+                                        animate={{ opacity: 1, x: 0 }}
+                                        transition={{ delay: index * 0.05 }}
+                                        className="group relative"
+                                    >
+                                        <Link href={`/learning/${source.id}`} className="block w-full">
+                                            <Button
+                                                variant="ghost"
+                                                className={cn(
+                                                    "w-full justify-start text-sm font-normal text-zinc-300 hover:bg-zinc-800/50 hover:text-white h-auto py-2",
+                                                    isCollapsed && "justify-center px-0",
+                                                    activeSourceId === source.id && "bg-zinc-800 text-white"
+                                                )}
+                                            >
+                                                {!isCollapsed ? (
+                                                    <div className="w-full text-left min-w-0">
+                                                        <div className="truncate">
+                                                            {source.title || source.original_filename || 'Untitled Source'}
+                                                        </div>
+                                                        <div className="text-xs text-zinc-500 truncate">
+                                                            {source.status || 'pending'}
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <BookOpen className="h-4 w-4 shrink-0" />
+                                                )}
+                                            </Button>
+                                        </Link>
+                                    </motion.div>
+                                ))
+                            )}
+                        </AnimatePresence>
                     ) : conversations.length === 0 ? (
                         <div className="p-2 text-xs text-zinc-500">No history</div>
                     ) : (
@@ -136,7 +228,7 @@ export function Sidebar() {
                                             className={cn(
                                                 "w-full justify-start text-sm font-normal text-zinc-300 hover:bg-zinc-800/50 hover:text-white h-auto py-2 pr-8",
                                                 isCollapsed && "justify-center px-0",
-                                                pathname?.includes(chat.id) && "bg-zinc-800 text-white"
+                                                isChatMode && activeChatId === chat.id && "bg-zinc-800 text-white"
                                             )}
                                         >
                                             {!isCollapsed ? (

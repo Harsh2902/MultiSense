@@ -12,7 +12,7 @@ export interface QueuedJob {
     id: string;
     source_id: string;
     user_id: string;
-    conversation_id: string;
+    conversation_id: string | null;
     status: ProcessingStatus;
     attempts: number;
     max_attempts: number;
@@ -78,7 +78,7 @@ class JobQueue {
     async add(
         sourceId: string,
         userId: string,
-        conversationId: string
+        conversationId: string | null
     ): Promise<QueuedJob> {
         // Check for existing job
         const existingJob = Array.from(this.jobs.values()).find(

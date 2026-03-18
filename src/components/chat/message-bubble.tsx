@@ -5,17 +5,25 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '@/lib/utils';
 import { Bot, User } from 'lucide-react';
+import { StudyToolMessage } from '@/components/chat/study-tool-message';
 
 export interface Message {
     id: string;
     role: 'user' | 'assistant' | 'system';
     content: string;
+    metadata?: Record<string, unknown>;
+    conversation_id?: string;
 }
 
 import { motion } from 'framer-motion';
 
 export const MessageBubble = React.memo(function MessageBubble({ message }: { message: Message }) {
     const isUser = message.role === 'user';
+    const isStudyToolMessage = (
+        message.role === 'assistant' &&
+        typeof message.metadata?.study_tool === 'string' &&
+        (message.metadata?.study_tool === 'quiz' || message.metadata?.study_tool === 'flashcards')
+    );
 
     return (
         <motion.div
@@ -46,15 +54,19 @@ export const MessageBubble = React.memo(function MessageBubble({ message }: { me
                     "relative flex-1 overflow-hidden break-words rounded-2xl p-4 shadow-sm",
                     isUser ? "bg-zinc-800 text-zinc-100 rounded-tr-none" : "bg-zinc-800/50 text-zinc-100 rounded-tl-none border border-zinc-700/50"
                 )}>
-                    <div className="prose prose-invert prose-p:leading-relaxed prose-pre:p-0 max-w-none">
-                        {isUser ? (
-                            <div className="whitespace-pre-wrap">{message.content}</div>
-                        ) : (
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                {message.content}
-                            </ReactMarkdown>
-                        )}
-                    </div>
+                    {isStudyToolMessage ? (
+                        <StudyToolMessage metadata={message.metadata} />
+                    ) : (
+                        <div className="prose prose-invert prose-p:leading-relaxed prose-pre:p-0 max-w-none">
+                            {isUser ? (
+                                <div className="whitespace-pre-wrap">{message.content}</div>
+                            ) : (
+                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                    {message.content}
+                                </ReactMarkdown>
+                            )}
+                        </div>
+                    )}
                 </div>
 
                 {/* Spacer to prevent message from stretching too wide if short */}

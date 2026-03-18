@@ -121,13 +121,24 @@ export class FlashcardService {
             const llmResponse = await this.llm.generate({
                 systemPrompt,
                 userMessage,
+                maxTokens: 1536,
+                temperature: 0.2,
                 jsonMode: true,
             });
 
             // 8. Parse and validate response
-            const parsed = parseLlmJson<GeneratedFlashcard[] | { error: string }>(
-                llmResponse.content
-            );
+            let parsed: GeneratedFlashcard[] | { error: string };
+            try {
+                parsed = parseLlmJson<GeneratedFlashcard[] | { error: string }>(
+                    llmResponse.content
+                );
+            } catch (parseError) {
+                await this.markSetFailed(set.id);
+                throw new StudyToolError(
+                    'The model returned an invalid flashcard format. Please try again.',
+                    'PARSE_ERROR'
+                );
+            }
 
             if (!Array.isArray(parsed)) {
                 if ('error' in parsed && parsed.error === 'insufficient_context') {

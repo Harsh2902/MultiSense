@@ -2,6 +2,8 @@
 // Centralized Error System - Typed errors for the entire application
 // =============================================================================
 
+import { AIProviderError } from '@/types/ai.types';
+
 // =============================================================================
 // Base Error
 // =============================================================================
@@ -125,6 +127,13 @@ export class InternalError extends AppError {
     }
 }
 
+export class RequestTimeoutError extends AppError {
+    constructor(message = 'Request timed out while processing') {
+        super(message, 'TIMEOUT', 504);
+        this.name = 'RequestTimeoutError';
+    }
+}
+
 // =============================================================================
 // Error Normalizer
 // =============================================================================
@@ -139,19 +148,32 @@ export function normalizeError(err: unknown): AppError {
         return err;
     }
 
-    // AI Provider errors (Phase 9)
-    if (err instanceof Error && err.name === 'AIProviderError') {
+    // AI Provider errors (including subclasses like ProviderUnavailableError)
+    if (err instanceof AIProviderError) {
+        if (err.code === 'RATE_LIMIT' || err.code === 'RATE_LIMITED') {
+            return new RateLimitedError();
+        }
+        if (err.code === 'TOKEN_LIMIT') {
+            return new ValidationError(err.message, { provider: err.provider });
+        }
+        return new ExternalServiceError(
+            err.provider || 'ai',
+            err
+        );
+    }
+
+    // AI provider-like errors from other module instances / boundaries
+    if (err instanceof Error && 'provider' in err && 'code' in err) {
         const aiErr = err as Error & { code?: string; provider?: string };
-        if (aiErr.code === 'RATE_LIMIT') {
+        if (aiErr.code === 'RATE_LIMIT' || aiErr.code === 'RATE_LIMITED') {
             return new RateLimitedError();
         }
         if (aiErr.code === 'TOKEN_LIMIT') {
             return new ValidationError(aiErr.message, { provider: aiErr.provider });
         }
-        return new ExternalServiceError(
-            (aiErr.provider as string) || 'ai',
-            aiErr
-        );
+        if (aiErr.provider) {
+            return new ExternalServiceError(aiErr.provider, aiErr);
+        }
     }
 
     // Study tool errors
@@ -160,6 +182,12 @@ export function normalizeError(err: unknown): AppError {
         const code = studyErr.code || 'STUDY_ERROR';
         if (code === 'INSUFFICIENT_CONTEXT' || code === 'TOKEN_OVERFLOW') {
             return new ValidationError(studyErr.message, { code });
+        }
+        if (code === 'CONCURRENT_GENERATION') {
+            return new ConflictError(studyErr.message);
+        }
+        if (code === 'RATE_LIMITED') {
+            return new RateLimitedError();
         }
         if (code === 'NOT_FOUND') {
             return new NotFoundError(studyErr.message);
@@ -201,6 +229,9 @@ export function normalizeError(err: unknown): AppError {
 
     // Generic Error
     if (err instanceof Error) {
+        if (err.message.toLowerCase().includes('request timeout')) {
+            return new RequestTimeoutError();
+        }
         return new InternalError(err.message, err);
     }
 

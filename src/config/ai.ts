@@ -53,7 +53,7 @@ export const AI_DEFAULTS = {
     maxTokens: 4096,
 
     /** Request timeout in milliseconds */
-    requestTimeoutMs: 30_000,
+    requestTimeoutMs: 120_000,
 
     /** Streaming chunk timeout (no data for this long = abort) */
     streamTimeoutMs: 10_000,

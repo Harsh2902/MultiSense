@@ -23,18 +23,47 @@ export const GET = withApiHandler(async (request: NextRequest): Promise<NextResp
     setRequestUserId(auth.userId);
 
     const searchParams = request.nextUrl.searchParams;
+    const rawLimit = searchParams.get('limit') || undefined;
+    const rawCursor = searchParams.get('cursor') || undefined;
+    const rawMode = searchParams.get('mode') || undefined;
+
     const queryResult = listConversationsQuerySchema.safeParse({
-        limit: searchParams.get('limit') || undefined,
-        cursor: searchParams.get('cursor') || undefined,
-        mode: searchParams.get('mode') || undefined,
+        limit: rawLimit,
+        cursor: rawCursor,
+        mode: rawMode,
     });
 
+    const parsedLimit = Number(rawLimit);
+    const fallbackMode: 'chat' | 'learning' | undefined =
+        rawMode === 'chat' || rawMode === 'learning' ? rawMode : undefined;
+    const fallbackQuery = {
+        limit: Number.isFinite(parsedLimit) && parsedLimit >= 1 && parsedLimit <= 100
+            ? Math.trunc(parsedLimit)
+            : 20,
+        cursor: rawCursor,
+        mode: fallbackMode,
+    };
+    const query = queryResult.success ? queryResult.data : fallbackQuery;
     if (!queryResult.success) {
-        throw new ValidationError('Validation failed', queryResult.error.flatten());
+        console.warn('[API] Invalid conversation list params, using fallback defaults:', {
+            limit: rawLimit,
+            cursor: rawCursor,
+            mode: rawMode,
+        });
     }
 
     const chatService = new ChatService(auth.userId);
-    const result = await chatService.listConversations(queryResult.data);
+    let result: PaginatedResponse<ConversationWithPreview>;
+    try {
+        result = await chatService.listConversations(query);
+    } catch (error) {
+        console.error('[API] Failed to list conversations. Returning empty list fallback:', error);
+        result = {
+            data: [],
+            count: 0,
+            has_more: false,
+        };
+    }
 
     return NextResponse.json<PaginatedResponse<ConversationWithPreview>>(result);
 });
